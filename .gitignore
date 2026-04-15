@@ -1,0 +1,33 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# IDE/system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime data/output/logs (generated)
+data/
+output/
+logs/
+
+# Root generated Excel and temp files
+gem_bids.xlsx
+doubtful_bids.xlsx
+~$*.xlsx
+
+# Local notes
+*.log
