@@ -24,7 +24,7 @@
     },
     {
       "parameters": {
-        "command": "cd \"C:\\Users\\WiJungle\\Desktop\\Gem Bid Extractor\"; python main.py",
+        "command": "cd /d \"C:\\Users\\WiJungle\\Desktop\\Gem Bid Extractor\" && python main.py",
         "timeout": 600
       },
       "name": "Run Extractor",
