@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from openpyxl import load_workbook
 
-from src.gem_bid_extractor.supabase_store import SupabaseStore
-
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from gem_bid_extractor.supabase_store import SupabaseStore
+
 EXTRACTED_FILE = ROOT / "output" / "Extracted_bids.xlsx"
 DOUBTFUL_FILE = ROOT / "output" / "doubtful_bids.xlsx"
 
