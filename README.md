@@ -64,6 +64,16 @@ cd dashboard
 npm run dev
 ```
 
+## Backfill Dashboard Data
+
+If the dashboard is deployed correctly but shows no rows, backfill existing local Excel output into Supabase:
+
+```powershell
+python tools/backfill_dashboard_from_excel.py
+```
+
+Then refresh the dashboard URL.
+
 ## Render Deployment
 
 Deploy the dashboard as a separate Render web service.
