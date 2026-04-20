@@ -38,12 +38,26 @@ class ExcelWriter:
         refs = self._existing_refs()
         new_bids = [b for b in bids if b.get("Reference No.") and b["Reference No."] not in refs]
         if not new_bids:
+            if not self.path.exists():
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "GEM Bids"
+                ws.append(COLUMNS)
+                for cell in ws[1]:
+                    cell.font = self._HFONT
+                    cell.fill = self._HFILL
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    cell.border = self._BORDER
+                wb.save(self.path)
+                wb.close()
             return 0
 
         if self.path.exists():
             wb = load_workbook(self.path)
             ws = wb.active
         else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             wb = Workbook()
             ws = wb.active
             ws.title = "GEM Bids"

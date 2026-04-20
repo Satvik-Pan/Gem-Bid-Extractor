@@ -1,0 +1,252 @@
+.page {
+  --background: #fafafa;
+  --foreground: #fff;
+
+  --text-primary: #000;
+  --text-secondary: #666;
+
+  --button-primary-hover: #383838;
+  --button-secondary-hover: #f2f2f2;
+  --button-secondary-border: #ebebeb;
+
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-geist-sans);
+  background-color: var(--background);
+}
+
+.main {
+  display: flex;
+  flex: 1;
+  width: 100%;
+  max-width: 800px;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  background-color: var(--foreground);
+  padding: 120px 60px;
+}
+
+.intro {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 24px;
+}
+
+.intro h1 {
+  max-width: 320px;
+  font-size: 40px;
+  font-weight: 600;
+  line-height: 48px;
+  letter-spacing: -2.4px;
+  text-wrap: balance;
+  color: var(--text-primary);
+}
+
+.intro p {
+  max-width: 440px;
+  font-size: 18px;
+  line-height: 32px;
+  text-wrap: balance;
+  color: var(--text-secondary);
+}
+
+.pageShell {
+  width: min(1280px, 96vw);
+  margin: 32px auto;
+  display: grid;
+  gap: 16px;
+}
+
+.headerCard {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: linear-gradient(135deg, #fcfdff, #eef3f8 60%);
+  padding: 22px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.eyebrow {
+  color: var(--text-1);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.pageTitle {
+  margin-top: 4px;
+  font-size: 28px;
+  line-height: 1.1;
+}
+
+.pageSub {
+  margin-top: 8px;
+  color: var(--text-1);
+}
+
+.statsBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.statsLabel {
+  color: var(--text-1);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.statsValue {
+  font-family: var(--font-jet-mono), monospace;
+  font-size: 30px;
+}
+
+.mainCard {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--bg-1);
+  padding: 16px;
+}
+
+.tabRow {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tab {
+  border: 1px solid var(--line);
+  background: #f4f7fa;
+  color: var(--text-0);
+  border-radius: 10px;
+  font-weight: 600;
+  padding: 10px 14px;
+  cursor: pointer;
+}
+
+.tabActive {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.panelTitleRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 8px 0 12px;
+}
+
+.badgeMuted {
+  font-size: 12px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text-1);
+}
+
+.errorBox {
+  border: 1px solid #f0c3c3;
+  background: #fff4f4;
+  color: #8d2323;
+  padding: 10px 12px;
+  border-radius: 10px;
+  margin-bottom: 12px;
+}
+
+.tableWrap {
+  overflow: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 960px;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  padding: 10px;
+  vertical-align: top;
+}
+
+.table th {
+  font-size: 12px;
+  color: var(--text-1);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: #f8fafc;
+}
+
+.refCell {
+  font-family: var(--font-jet-mono), monospace;
+  font-size: 13px;
+}
+
+.emptyCell {
+  text-align: center;
+  color: var(--text-1);
+  padding: 24px 10px;
+}
+
+.inlineActions {
+  display: flex;
+  gap: 8px;
+}
+
+.resolveBtn,
+.rejectBtn,
+.promoteBtn {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.resolveBtn {
+  background: #fff0f0;
+  color: var(--bad);
+  border-color: #f1c2c2;
+}
+
+.promoteBtn {
+  background: #eef9f2;
+  color: var(--ok);
+  border-color: #bde8cc;
+}
+
+.rejectBtn {
+  background: #fff3e8;
+  color: var(--warn);
+  border-color: #f0d4b5;
+}
+
+.historyLabel {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+@media (max-width: 900px) {
+  .headerCard {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .statsBlock {
+    align-items: flex-start;
+  }
+}

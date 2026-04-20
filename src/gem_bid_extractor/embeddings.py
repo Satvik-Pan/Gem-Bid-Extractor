@@ -16,10 +16,10 @@ class EmbeddingResult:
 class EmbeddingEngine:
     def __init__(self):
         self.model = SentenceTransformer(EMBEDDING_MODEL)
-        self.ref_vectors = self.model.encode(EMBEDDING_REF_TEXTS, convert_to_tensor=True)
+        self.ref_vectors = self.model.encode(EMBEDDING_REF_TEXTS, convert_to_tensor=True, show_progress_bar=False)
 
     def similarity(self, text: str) -> EmbeddingResult:
-        vec = self.model.encode(text, convert_to_tensor=True)
+        vec = self.model.encode(text, convert_to_tensor=True, show_progress_bar=False)
         sims = util.pytorch_cos_sim(vec, self.ref_vectors)[0]
         max_sim = float(sims.max().item()) if sims.numel() else 0.0
         return EmbeddingResult(similarity=max_sim)

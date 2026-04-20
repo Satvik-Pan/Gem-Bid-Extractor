@@ -129,9 +129,10 @@ class GemScraper:
         start_raw = _val(doc.get("final_start_date_sort", ""))
         end_raw = _val(doc.get("final_end_date_sort", ""))
 
+        ref_no = _val(doc.get("b_bid_number", ""))
         return {
             "Category": category.split(",")[0].strip() if category else "",
-            "Reference No.": _val(doc.get("b_bid_number", "")),
+            "Reference No.": ref_no,
             "Date": _fmt_date(end_raw) if end_raw else "",
             "Name": _val(doc.get("bbt_title", "")) or category,
             "Start Date": _fmt_date(start_raw) if start_raw else "",
@@ -142,9 +143,44 @@ class GemScraper:
             "Contact": "",
             "EMAIL": _val(doc.get("b.b_created_by", "")),
             "Department": department,
+            "Source URL": f"https://bidplus.gem.gov.in/bidlists/{ref_no}" if ref_no else GEM_PAGE_URL,
+            "Bid ID": str(_val(doc.get("b_id", ""))),
             "_keyword": keyword,
             "_start_dt": start_raw,
         }
+
+    def search_full(self, cutoff: datetime, max_pages: int = 60) -> list[dict]:
+        bids: list[dict] = []
+        seen_ids: set[str] = set()
+        page = 1
+        while page <= max_pages:
+            data = self._search_page("", page)
+            docs = data.get("response", {}).get("response", {}).get("docs", []) if data else []
+            if not docs:
+                break
+
+            stop = False
+            for doc in docs:
+                bid_id = str(_val(doc.get("b_id", "")))
+                if not bid_id or bid_id in seen_ids:
+                    continue
+                start_raw = _val(doc.get("final_start_date_sort", ""))
+                start_dt = _parse_iso(start_raw) if start_raw else None
+                if start_dt and start_dt < cutoff:
+                    stop = True
+                    break
+                seen_ids.add(bid_id)
+                bid = self._parse_bid(doc, "")
+                bid["_pipeline"] = "full"
+                bids.append(bid)
+
+            if stop:
+                break
+            page += 1
+            time.sleep(random.uniform(*REQUEST_DELAY))
+
+        logger.info("Fetched %d unique bids from full feed", len(bids))
+        return bids
 
     def search_keyword(self, keyword: str, cutoff: datetime, seen_ids: set[str]) -> list[dict]:
         bids: list[dict] = []
@@ -166,7 +202,9 @@ class GemScraper:
                     stop = True
                     break
                 seen_ids.add(bid_id)
-                bids.append(self._parse_bid(doc, keyword))
+                bid = self._parse_bid(doc, keyword)
+                bid["_pipeline"] = "keyword"
+                bids.append(bid)
 
             if stop or page >= 20:
                 break

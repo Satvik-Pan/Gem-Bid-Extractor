@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!dashboard/.env.example
 
 # Python cache/build
 __pycache__/
