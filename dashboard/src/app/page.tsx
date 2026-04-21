@@ -54,6 +54,13 @@ export default function Home() {
     void loadRows();
   }, [loadRows]);
 
+  useEffect(() => {
+    const timer = setInterval(() => {
+      void loadRows();
+    }, 60000);
+    return () => clearInterval(timer);
+  }, [loadRows]);
+
   const runAction = async (bidId: string, action: "resolve" | "reject" | "promote") => {
     setError("");
     try {
