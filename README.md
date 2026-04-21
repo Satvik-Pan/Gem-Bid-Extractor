@@ -74,6 +74,31 @@ python tools/backfill_dashboard_from_excel.py
 
 Then refresh the dashboard URL.
 
+## Daily Automation at 11:00 AM
+
+To run extractor + DB sync + optional GitHub auto-push every day at 11:00 AM on Windows:
+
+1. Ensure environment is configured in `.env`.
+2. Keep `AUTO_GIT_PUSH=1` (default in `run_extractor.bat`).
+3. Register the scheduled task:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "11:00"
+```
+
+4. Verify task:
+
+```powershell
+Get-ScheduledTask -TaskName GemBidExtractorDaily | Format-List
+```
+
+This task runs `run_extractor.bat`, which performs:
+
+1. GEM extraction and dual pipeline classification.
+2. Excel append update.
+3. Supabase sync for dashboard tabs.
+4. Git auto-commit + GitHub push (when changes exist).
+
 ## Render Deployment
 
 Deploy the dashboard as a separate Render web service.
