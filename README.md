@@ -2,7 +2,7 @@
 
 Cybersecurity bid extractor with two independent GEM pipelines, strict Anthropic classification, append-only Excel outputs, and a Supabase-backed operations dashboard.
 
-## Current Architecture
+## Architecture
 
 1. Pipeline 1: full GEM feed from the last 3 days, then broad LLM prefilter.
 2. Pipeline 2: keyword-based GEM search.
@@ -15,7 +15,7 @@ Cybersecurity bid extractor with two independent GEM pipelines, strict Anthropic
 ## Project Structure
 
 - `main.py` - extractor entrypoint.
-- `run_extractor.bat` - Windows launcher for one-click runs.
+- `run_extractor.bat` - Windows launcher (runs extractor + auto-push to GitHub).
 - `src/gem_bid_extractor/` - extractor package.
 - `src/gem_bid_extractor/pipeline.py` - orchestration for both pipelines and final classification.
 - `src/gem_bid_extractor/anthropic_llm.py` - strict Anthropic client with retry and DNS fallback.
@@ -25,6 +25,7 @@ Cybersecurity bid extractor with two independent GEM pipelines, strict Anthropic
 - `data/` - processed state and DB sync queue files.
 - `logs/` - runtime logs.
 - `dashboard/` - Next.js operations dashboard.
+- `tools/` - utility scripts (auto git push, task scheduler registration, backfill).
 
 ## Local Setup
 
@@ -57,7 +58,7 @@ or on Windows:
 run_extractor.bat
 ```
 
-## Run Dashboard
+## Run Dashboard Locally
 
 ```powershell
 cd dashboard
@@ -66,7 +67,7 @@ npm run dev
 
 ## Backfill Dashboard Data
 
-If the dashboard is deployed correctly but shows no rows, backfill existing local Excel output into Supabase:
+If the dashboard shows no rows, backfill existing local Excel output into Supabase:
 
 ```powershell
 python tools/backfill_dashboard_from_excel.py
@@ -74,32 +75,34 @@ python tools/backfill_dashboard_from_excel.py
 
 Then refresh the dashboard URL.
 
-## Daily Automation at 11:00 AM
+## Daily Automation (Windows Task Scheduler)
 
-To run extractor + DB sync + optional GitHub auto-push every day at 11:00 AM on Windows:
+The extractor runs automatically every day at **12:00 PM** via Windows Task Scheduler.
 
-1. Ensure environment is configured in `.env`.
-2. Keep `AUTO_GIT_PUSH=1` (default in `run_extractor.bat`).
-3. Register the scheduled task:
+### Register the scheduled task:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "11:00"
+powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "12:00"
 ```
 
-4. Verify task:
+### Verify the task:
 
 ```powershell
 Get-ScheduledTask -TaskName GemBidExtractorDaily | Format-List
 ```
 
-This task runs `run_extractor.bat`, which performs:
+### What the daily run does:
 
-1. GEM extraction and dual pipeline classification.
-2. Excel append update.
+1. GEM extraction (last 3 days of bids) and dual pipeline classification.
+2. Excel append update (`output/Extracted_bids.xlsx`, `output/doubtful_bids.xlsx`).
 3. Supabase sync for dashboard tabs.
 4. Git auto-commit + GitHub push (when changes exist).
 
-## Render Deployment
+### Monitor task runs:
+
+Open **Task Scheduler** (`taskschd.msc`) → find `GemBidExtractorDaily` → check the **History** tab and **Last Run Result** column.
+
+## Render Deployment (Dashboard)
 
 Deploy the dashboard as a separate Render web service.
 
@@ -114,10 +117,10 @@ Deploy the dashboard as a separate Render web service.
    - `SUPABASE_DB_NAME=postgres`
    - `SUPABASE_DB_USER=postgres.rigivunjxinvyzlzctoj`
    - `SUPABASE_DB_PASSWORD=...`
-5. If you want the extractor on Render too, deploy it as a separate worker service or scheduled job. The dashboard should stay separate from the extractor because the extractor is long-running and API-heavy.
 
 ## Notes
 
-- The extractor now uses queue-first persistence, so DB outages only delay sync instead of breaking the run.
+- The extractor uses queue-first persistence, so DB outages only delay sync instead of breaking the run.
 - Anthropic calls include retries plus DNS/IP fallback using a cached host resolution path.
 - Keep the repository secrets out of GitHub; use `.env` locally and Render environment variables in production.
+- The `StartWhenAvailable` flag ensures missed runs (e.g. PC was asleep) execute when the machine wakes up.

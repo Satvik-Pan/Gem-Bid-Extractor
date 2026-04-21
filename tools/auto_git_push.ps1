@@ -10,28 +10,30 @@ if (-not $RepoPath) {
 
 Set-Location $RepoPath
 
-$originFetch = git remote get-url origin
-if (-not $originFetch -or $originFetch -notmatch "github.com") {
-    Write-Warning "[auto-git] Origin fetch URL is not GitHub. Skipping push."
+# Verify origin points to GitHub
+$originUrl = git remote get-url origin 2>$null
+if (-not $originUrl -or $originUrl -notmatch "github\.com") {
+    Write-Warning "[auto-git] Origin URL is not GitHub ($originUrl). Skipping push."
     exit 0
 }
 
-$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+# Check for uncommitted changes
 $status = git status --porcelain
 if (-not $status) {
     Write-Output "[auto-git] No changes to commit."
     exit 0
 }
 
+# Stage, commit, and push to GitHub
+$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 git add -A
 $msg = "Auto update after extractor run ($timestamp)"
 git commit -m $msg | Out-Null
 
 try {
-    # Push directly to the GitHub fetch URL to avoid any extra configured push URLs.
-    git push $originFetch main | Out-Null
-    Write-Output "[auto-git] Pushed to origin/main successfully."
+    git push origin main 2>&1 | Out-Null
+    Write-Output "[auto-git] Pushed to GitHub origin/main successfully."
 } catch {
-    Write-Warning "[auto-git] Push failed: $($_.Exception.Message)"
+    Write-Warning "[auto-git] Push to GitHub failed: $($_.Exception.Message)"
     exit 0
 }

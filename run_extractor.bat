@@ -1,21 +1,33 @@
 @echo off
 setlocal
+
+:: Change to the directory where this batch file lives
 cd /d "%~dp0"
 
-if "%AUTO_GIT_PUSH%"=="" set AUTO_GIT_PUSH=1
+echo ============================================
+echo  GEM Bid Extractor - Daily Run
+echo  %date% %time%
+echo ============================================
 
+:: Run the Python extractor
 python main.py
 if %errorlevel% neq 0 (
-  echo Extraction failed with code %errorlevel%
+  echo [ERROR] Extraction failed with code %errorlevel%
   exit /b %errorlevel%
 )
 
-if /I "%AUTO_GIT_PUSH%"=="1" (
-  echo Running auto git sync...
-  powershell -ExecutionPolicy Bypass -File "%~dp0tools\auto_git_push.ps1"
-)
+:: Auto git commit and push to GitHub if there are changes
+echo.
+echo Running auto git sync to GitHub...
+powershell -ExecutionPolicy Bypass -File "%~dp0tools\auto_git_push.ps1"
 
-echo Extraction completed.
-echo Updated files: output\Extracted_bids.xlsx and output\doubtful_bids.xlsx
-echo Dashboard source updated in Supabase worklist for extracted/doubtful/history tabs.
+echo.
+echo ============================================
+echo  Extraction completed successfully.
+echo  Updated: output\Extracted_bids.xlsx
+echo           output\doubtful_bids.xlsx
+echo  Dashboard: Supabase synced for all tabs.
+echo  Git: Changes pushed to GitHub (if any).
+echo ============================================
+
 endlocal
