@@ -10,6 +10,11 @@ if (-not $RepoPath) {
 
 Set-Location $RepoPath
 
+$originFetch = git remote get-url origin
+if ($originFetch -and $originFetch -match "github.com") {
+    git remote set-url --push origin $originFetch | Out-Null
+}
+
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 $status = git status --porcelain
 if (-not $status) {
