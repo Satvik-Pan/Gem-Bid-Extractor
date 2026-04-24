@@ -205,7 +205,6 @@
   gap: 8px;
 }
 
-.resolveBtn,
 .rejectBtn,
 .promoteBtn {
   border: 1px solid transparent;
@@ -214,12 +213,6 @@
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
-}
-
-.resolveBtn {
-  background: #fff0f0;
-  color: var(--bad);
-  border-color: #f1c2c2;
 }
 
 .promoteBtn {
@@ -237,7 +230,14 @@
 .historyLabel {
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-1);
+}
+
+.historyOk {
+  color: #118a4e;
+}
+
+.historyBad {
+  color: #c23b3b;
 }
 
 @media (max-width: 900px) {

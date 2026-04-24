@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 from pathlib import Path
 
@@ -25,17 +26,65 @@ LOG_FILE = LOG_DIR / "scraper.log"
 SYNC_QUEUE_FILE = DATA_DIR / "db_sync_queue.jsonl"
 DNS_CACHE_FILE = DATA_DIR / "dns_cache.json"
 
-KEYWORDS = [
-    "router", "ips", "ngfw", "firewall", "vpn", "nextgen", "utm", "sdwan", "waf",
-    "web security", "network security", "endpoint", "cyber security", "sophos", "checkpoint",
-    "fortinet", "fortigate", "palo alto", "quickheal", "forcepoint", "cisco", "juniper",
-    "sonicwall", "trendmicro", "mcafee", "radware", "ddos", "data loss prevention", "scada",
-    "edr", "xdr", "soc", "siem", "iam", "ssl", "tls", "ipsec", "intrusion detection",
-    "intrusion prevention", "malware", "ransomware", "threat intelligence", "penetration testing",
-    "vulnerability assessment", "security audit", "nac", "pam", "mfa", "zero trust",
-    "cloud security", "container security", "api security", "encryption", "data protection",
-    "disaster recovery", "iso 27001",
+KEYWORDS_FILE = BASE_DIR / "src" / "gem_bid_extractor" / "keywords.csv"
+MAX_PAGES_PER_PIPELINE = 5
+
+DEFAULT_INCLUSION_KEYWORDS = [
+    "router",
+    "ngfw",
+    "firewall",
+    "fire wall",
+    "vpn",
+    "utm",
+    "next generation firewall",
+    "unified threat manager",
+    "network security",
+    "web application firewall",
+    "waf",
 ]
+
+DEFAULT_EXCLUSION_KEYWORDS = [
+    "ips", "load balancer", "nextgen", "next", "unified", "sdwan", "sd wan", "software define wan",
+    "dns", "intrusion", "llb", "slb", "web security", "threat", "internet", "gateway", "perimeter",
+    "endpoint", "eps", "malware", "ransomware", "ipsec", "edge", "cyber security", "virus", "aaa",
+    "firepower", "asa", "bandwidth", "renewal", "authentication", "lan", "armynet", "domain",
+    "anti-apt", "anti-atp", "sophos", "gajshield", "checkpoint", "anexgate", "tacitine", "fortinet",
+    "fortigate", "paloalto", "quickheal", "forcepoint", "cisco", "juniper", "sonicwall", "trendmicro",
+    "mcafee", "radware", "array networks", "haltdos", "ddos", "trellix", "data loss prevention",
+    "scada/ scada firewall",
+]
+
+
+def _normalize_term(term: str) -> str:
+    return " ".join(term.strip().lower().split())
+
+
+def _load_keyword_sets() -> tuple[list[str], list[str]]:
+    if not KEYWORDS_FILE.exists():
+        return DEFAULT_INCLUSION_KEYWORDS, DEFAULT_EXCLUSION_KEYWORDS
+
+    inclusion: list[str] = []
+    exclusion: list[str] = []
+    try:
+        with KEYWORDS_FILE.open("r", encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                inc = _normalize_term(str(row.get("Inclusion", "")))
+                exc = _normalize_term(str(row.get("Exclusion", "")))
+                if inc:
+                    inclusion.append(inc)
+                if exc:
+                    exclusion.append(exc)
+    except OSError:
+        return DEFAULT_INCLUSION_KEYWORDS, DEFAULT_EXCLUSION_KEYWORDS
+
+    inclusion = inclusion or DEFAULT_INCLUSION_KEYWORDS
+    exclusion = exclusion or DEFAULT_EXCLUSION_KEYWORDS
+    return sorted(set(inclusion)), sorted(set(exclusion))
+
+
+INCLUSION_KEYWORDS, EXCLUSION_KEYWORDS = _load_keyword_sets()
+KEYWORDS = INCLUSION_KEYWORDS
 
 COLUMNS = [
     "Category", "Reference No.", "Date", "Name", "Start Date", "Model - Yr", "Quantity",

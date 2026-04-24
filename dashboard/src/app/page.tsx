@@ -137,16 +137,22 @@ export default function Home() {
                     <td>{row.llm_confidence != null ? row.llm_confidence.toFixed(3) : "-"}</td>
                     <td>{row.llm_reason || "-"}</td>
                     <td>
-                      {tab === "extracted" ? (
-                        <button className={styles.resolveBtn} onClick={() => void runAction(row.bid_id, "resolve")}>Seen</button>
-                      ) : null}
-                      {tab === "doubtful" ? (
+                      {tab === "extracted" || tab === "doubtful" ? (
                         <div className={styles.inlineActions}>
-                          <button className={styles.promoteBtn} onClick={() => void runAction(row.bid_id, "promote")}>Tick</button>
+                          <button
+                            className={styles.promoteBtn}
+                            onClick={() => void runAction(row.bid_id, tab === "doubtful" ? "promote" : "resolve")}
+                          >
+                            Tick
+                          </button>
                           <button className={styles.rejectBtn} onClick={() => void runAction(row.bid_id, "reject")}>Cross</button>
                         </div>
                       ) : null}
-                      {tab === "history" ? <span className={styles.historyLabel}>{row.status}</span> : null}
+                      {tab === "history" ? (
+                        <span className={`${styles.historyLabel} ${row.status === "RESOLVED" ? styles.historyOk : styles.historyBad}`}>
+                          {row.status === "RESOLVED" ? "ACCEPTED" : "REJECTED"}
+                        </span>
+                      ) : null}
                     </td>
                   </tr>
                 );

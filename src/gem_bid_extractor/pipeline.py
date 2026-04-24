@@ -8,7 +8,9 @@ from .excel_writer import ExcelWriter
 from .gem_client import GemScraper
 from .settings import (
     DOUBTFUL_FILE,
+    EXCLUSION_KEYWORDS,
     EXCEL_FILE,
+    INCLUSION_KEYWORDS,
     KEYWORDS,
     LOOKBACK_DAYS,
 )
@@ -54,6 +56,18 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
     return list(merged.values())
 
 
+def _keyword_flags(bid: dict) -> tuple[bool, bool]:
+    text_parts = [
+        str(bid.get("Name", "")),
+        str(bid.get("Description", "")),
+        str(bid.get("Category", "")),
+    ]
+    haystack = " ".join(text_parts).lower()
+    has_inclusion = any(term in haystack for term in INCLUSION_KEYWORDS)
+    has_exclusion = any(term in haystack for term in EXCLUSION_KEYWORDS)
+    return has_inclusion, has_exclusion
+
+
 def run() -> dict:
     scraper = GemScraper()
     llm = AnthropicClaudeClassifier()
@@ -70,7 +84,8 @@ def run() -> dict:
     if not llm.enabled:
         raise RuntimeError("Anthropic classifier is disabled. Configure ANTHROPIC_API_KEY/ANTHROPIC_MODEL/ANTHROPIC_BASE_URL in .env")
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(days=LOOKBACK_DAYS - 1)
 
     scraper.init_session()
     try:
@@ -139,10 +154,23 @@ def run() -> dict:
         category = str(final_vote.get("category", "REJECTED")).upper()
         confidence = round(float(final_vote.get("confidence", 0.0)), 3)
         reason = str(final_vote.get("reason", ""))
+        has_inclusion, has_exclusion = _keyword_flags(bid)
+
+        if has_exclusion and category == "EXTRACTED":
+            category = "DOUBTFUL"
+            reason = f"{reason} | Exclusion keyword detected; moved to DOUBTFUL.".strip(" |")
+        elif has_exclusion and category == "REJECTED" and confidence >= 0.75:
+            category = "DOUBTFUL"
+            reason = f"{reason} | Exclusion keyword detected with strong cyber confidence; moved to DOUBTFUL.".strip(" |")
+        elif has_inclusion and not has_exclusion and category != "EXTRACTED":
+            category = "EXTRACTED"
+            reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
 
         bid["Final Category"] = category
         bid["LLM Confidence"] = confidence
         bid["LLM Reason"] = reason
+        bid["Inclusion Match"] = has_inclusion
+        bid["Exclusion Match"] = has_exclusion
 
         if category == "EXTRACTED":
             relevant.append(bid)

@@ -1,0 +1,59 @@
+Inclusion,Exclusion
+Router,IPS
+NGFW,Load Balancer
+FIREWALL,NextGen
+FIRE WALL,Next
+VPN,UNIFIED
+UTM,SDWAN
+Next Generation Firewall,SD WAN
+UNIFIED Threat Manager,Software Define WAN
+Network Security,DNS
+Web Application Firewall,Intrusion
+WAF,LLB
+,SLB
+,Web Security
+,Threat
+,Internet
+,Gateway
+,Perimeter
+,Endpoint
+,EPS
+,Malware
+,Ransomware
+,IPSec
+,Edge
+,Cyber Security
+,Virus
+,AAA
+,Firepower
+,ASA
+,Bandwidth
+,Renewal
+,Authentication
+,LAN
+,Armynet
+,Domain
+,Anti-APT
+,Anti-ATP
+,Sophos
+,Gajshield
+,Checkpoint
+,Anexgate
+,Tacitine
+,Fortinet
+,Fortigate
+,PaloAlto
+,Quickheal
+,Forcepoint
+,CISCO
+,Juniper
+,Sonicwall
+,TrendMicro
+,Mcafee
+,Radware
+,Array Networks
+,Haltdos
+,DDoS
+,Trellix
+,Data Loss Prevention
+,Scada/ Scada Firewall

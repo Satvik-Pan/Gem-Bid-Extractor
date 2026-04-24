@@ -24,7 +24,7 @@ export async function PATCH(
         `
           update bid_worklist
           set status = 'RESOLVED', resolved_at = now(), last_seen_at = now()
-          where bid_id = $1 and category = 'EXTRACTED' and status = 'ACTIVE'
+          where bid_id = $1 and status = 'ACTIVE'
         `,
         [bidId]
       );
@@ -46,7 +46,7 @@ export async function PATCH(
     await pool.query(
       `
         update bid_worklist
-        set category = 'EXTRACTED', status = 'ACTIVE', resolved_at = null, last_seen_at = now(),
+        set category = 'EXTRACTED', status = 'RESOLVED', resolved_at = now(), last_seen_at = now(),
             payload = jsonb_set(payload, '{Final Category}', '"EXTRACTED"', true)
         where bid_id = $1 and category = 'DOUBTFUL' and status = 'ACTIVE'
       `,

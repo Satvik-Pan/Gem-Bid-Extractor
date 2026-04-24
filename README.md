@@ -10,7 +10,7 @@ Cybersecurity bid extractor with two independent GEM pipelines, strict Anthropic
 4. Final strict Anthropic classification into `EXTRACTED`, `DOUBTFUL`, or `REJECTED`.
 5. Append-only Excel writes for extracted and doubtful rows.
 6. Queue-first Supabase sync so DB failure does not stop extraction.
-7. Dashboard reads the shared worklist and supports Seen, Tick, and Cross actions.
+7. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
 
 ## Project Structure
 
@@ -77,12 +77,12 @@ Then refresh the dashboard URL.
 
 ## Daily Automation (Windows Task Scheduler)
 
-The extractor runs automatically every day at **12:00 PM** via Windows Task Scheduler.
+The extractor runs automatically every day at **11:00 AM** via Windows Task Scheduler.
 
 ### Register the scheduled task:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "12:00"
+powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "11:00"
 ```
 
 ### Verify the task:

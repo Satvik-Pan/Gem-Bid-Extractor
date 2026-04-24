@@ -13,6 +13,7 @@ import requests
 from .settings import (
     GEM_API_URL,
     GEM_PAGE_URL,
+    MAX_PAGES_PER_PIPELINE,
     MAX_RETRIES,
     REQUEST_DELAY,
     SESSION_REFRESH_EVERY,
@@ -149,9 +150,18 @@ class GemScraper:
             "_start_dt": start_raw,
         }
 
-    def search_full(self, cutoff: datetime, max_pages: int = 60) -> list[dict]:
+    @staticmethod
+    def _within_window(start_dt: Optional[datetime], min_date, max_date) -> bool:
+        if start_dt is None:
+            return True
+        start_date = start_dt.astimezone(timezone.utc).date()
+        return min_date <= start_date <= max_date
+
+    def search_full(self, cutoff: datetime, max_pages: int = MAX_PAGES_PER_PIPELINE) -> list[dict]:
         bids: list[dict] = []
         seen_ids: set[str] = set()
+        cutoff_date = cutoff.astimezone(timezone.utc).date()
+        today_date = datetime.now(timezone.utc).date()
         page = 1
         while page <= max_pages:
             data = self._search_page("", page)
@@ -169,6 +179,8 @@ class GemScraper:
                 if start_dt and start_dt < cutoff:
                     stop = True
                     break
+                if not self._within_window(start_dt, cutoff_date, today_date):
+                    continue
                 seen_ids.add(bid_id)
                 bid = self._parse_bid(doc, "")
                 bid["_pipeline"] = "full"
@@ -184,8 +196,10 @@ class GemScraper:
 
     def search_keyword(self, keyword: str, cutoff: datetime, seen_ids: set[str]) -> list[dict]:
         bids: list[dict] = []
+        cutoff_date = cutoff.astimezone(timezone.utc).date()
+        today_date = datetime.now(timezone.utc).date()
         page = 1
-        while True:
+        while page <= MAX_PAGES_PER_PIPELINE:
             data = self._search_page(keyword, page)
             docs = data.get("response", {}).get("response", {}).get("docs", []) if data else []
             if not docs:
@@ -201,12 +215,14 @@ class GemScraper:
                 if start_dt and start_dt < cutoff:
                     stop = True
                     break
+                if not self._within_window(start_dt, cutoff_date, today_date):
+                    continue
                 seen_ids.add(bid_id)
                 bid = self._parse_bid(doc, keyword)
                 bid["_pipeline"] = "keyword"
                 bids.append(bid)
 
-            if stop or page >= 20:
+            if stop:
                 break
             page += 1
             time.sleep(random.uniform(*REQUEST_DELAY))
