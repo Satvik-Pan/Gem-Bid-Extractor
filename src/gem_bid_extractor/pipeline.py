@@ -136,16 +136,27 @@ def run() -> dict:
 
     combined_candidates = _merge_candidates(prefiltered_full, keyword_new)
     combined_candidates = [b for b in _dedupe_by_ref(combined_candidates) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
-    logger.info("Merged candidates for final classification: %d", len(combined_candidates))
 
-    final_map = llm.final_classify(combined_candidates) if combined_candidates else {}
-    final_coverage = (len(final_map) / len(combined_candidates)) if combined_candidates else 1.0
+    llm_candidates: list[dict] = []
+    excluded_dropped: list[dict] = []
+    for bid in combined_candidates:
+        _, has_exclusion = _keyword_flags(bid)
+        if has_exclusion:
+            excluded_dropped.append(bid)
+            continue
+        llm_candidates.append(bid)
+
+    logger.info("Merged candidates for final classification: %d", len(combined_candidates))
+    logger.info("Excluded bids dropped before final LLM: %d", len(excluded_dropped))
+
+    final_map = llm.final_classify(llm_candidates) if llm_candidates else {}
+    final_coverage = (len(final_map) / len(llm_candidates)) if llm_candidates else 1.0
 
     relevant: list[dict] = []
     doubtful: list[dict] = []
     rejected: list[dict] = []
 
-    for bid in combined_candidates:
+    for bid in llm_candidates:
         ref = str(bid.get("Reference No.", "")).strip()
         final_vote = final_map.get(ref)
         if final_vote is None:
@@ -156,13 +167,7 @@ def run() -> dict:
         reason = str(final_vote.get("reason", ""))
         has_inclusion, has_exclusion = _keyword_flags(bid)
 
-        if has_exclusion and category == "EXTRACTED":
-            category = "DOUBTFUL"
-            reason = f"{reason} | Exclusion keyword detected; moved to DOUBTFUL.".strip(" |")
-        elif has_exclusion and category == "REJECTED" and confidence >= 0.75:
-            category = "DOUBTFUL"
-            reason = f"{reason} | Exclusion keyword detected with strong cyber confidence; moved to DOUBTFUL.".strip(" |")
-        elif has_inclusion and not has_exclusion and category != "EXTRACTED":
+        if has_inclusion and not has_exclusion and category != "EXTRACTED":
             category = "EXTRACTED"
             reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
 
@@ -194,6 +199,8 @@ def run() -> dict:
         tracker.mark(bid.get("Reference No.", ""), "doubtful", 60, bid.get("LLM Confidence", 0))
     for bid in rejected:
         tracker.mark(bid.get("Reference No.", ""), "rejected", 0, bid.get("LLM Confidence", 0))
+    for bid in excluded_dropped:
+        tracker.mark(bid.get("Reference No.", ""), "excluded", 0, 0)
     tracker.save()
 
     logger.info("LLM prefilter coverage: %.2f", prefilter_coverage)
@@ -203,6 +210,8 @@ def run() -> dict:
 
     return {
         "new": len(combined_candidates),
+        "llm_candidates": len(llm_candidates),
+        "excluded_dropped": len(excluded_dropped),
         "relevant": len(relevant),
         "doubtful": len(doubtful),
         "rejected": len(rejected),

@@ -194,6 +194,12 @@
   font-size: 13px;
 }
 
+.refLink {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .emptyCell {
   text-align: center;
   color: var(--text-1);

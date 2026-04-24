@@ -35,7 +35,7 @@ export async function PATCH(
       await pool.query(
         `
           update bid_worklist
-          set status = 'REJECTED', resolved_at = now(), last_seen_at = now(), category = 'REJECTED'
+          set status = 'REVIEW_REJECTED', resolved_at = now(), last_seen_at = now(), category = 'REJECTED'
           where bid_id = $1 and status = 'ACTIVE'
         `,
         [bidId]

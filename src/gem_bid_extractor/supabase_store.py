@@ -143,11 +143,12 @@ class SupabaseStore:
 
                     status = "ACTIVE"
                     if incoming_category == "REJECTED":
-                        status = "REJECTED"
+                        # Auto-rejected rows are hidden from ops queues/history.
+                        status = "AUTO_REJECTED"
 
                     cur.execute("select status from bid_worklist where bid_id = %s", (bid_id,))
                     row = cur.fetchone()
-                    if row and row["status"] in {"RESOLVED", "REJECTED"}:
+                    if row and row["status"] in {"RESOLVED", "REVIEW_REJECTED"}:
                         continue
 
                     cur.execute(
@@ -163,7 +164,7 @@ class SupabaseStore:
                                 else excluded.category
                             end,
                             status = case
-                                when bid_worklist.status in ('RESOLVED', 'REJECTED') then bid_worklist.status
+                                when bid_worklist.status in ('RESOLVED', 'REVIEW_REJECTED') then bid_worklist.status
                                 else excluded.status
                             end,
                             llm_confidence = excluded.llm_confidence,

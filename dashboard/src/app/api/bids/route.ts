@@ -34,7 +34,7 @@ export async function GET(req: NextRequest) {
       select bid_id, reference_no, category, status, llm_confidence, llm_reason, pipeline_source, payload,
              first_seen_at, last_seen_at, resolved_at
       from bid_worklist
-      where status in ('RESOLVED', 'REJECTED')
+      where status in ('RESOLVED', 'REVIEW_REJECTED')
       order by coalesce(resolved_at, last_seen_at) desc
       limit 1000
     `;

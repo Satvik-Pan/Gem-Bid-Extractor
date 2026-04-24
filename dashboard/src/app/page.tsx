@@ -129,9 +129,18 @@ export default function Home() {
                 const payload = row.payload || {};
                 const name = String(payload["Name"] || "");
                 const dept = String(payload["Department"] || "");
+                const sourceUrl = String(payload["Source URL"] || "");
                 return (
                   <tr key={row.bid_id}>
-                    <td className={styles.refCell}>{row.reference_no}</td>
+                    <td className={styles.refCell}>
+                      {sourceUrl ? (
+                        <a className={styles.refLink} href={sourceUrl} target="_blank" rel="noreferrer">
+                          {row.reference_no}
+                        </a>
+                      ) : (
+                        row.reference_no
+                      )}
+                    </td>
                     <td>{name}</td>
                     <td>{dept}</td>
                     <td>{row.llm_confidence != null ? row.llm_confidence.toFixed(3) : "-"}</td>
