@@ -24,6 +24,7 @@ Cybersecurity bid extractor with two independent GEM pipelines, strict Anthropic
 - `output/` - generated Excel files.
 - `data/` - processed state and DB sync queue files.
 - `logs/` - runtime logs.
+- `data/last_run_status.json` - machine-readable status of the most recent extractor run.
 - `dashboard/` - Next.js operations dashboard.
 - `tools/` - utility scripts (auto git push, task scheduler registration, backfill).
 
@@ -102,6 +103,15 @@ Get-ScheduledTask -TaskName GemBidExtractorDaily | Format-List
 
 Open **Task Scheduler** (`taskschd.msc`) → find `GemBidExtractorDaily` → check the **History** tab and **Last Run Result** column.
 
+### Daily validation checklist
+
+After the scheduled run, verify:
+
+1. `data/last_run_status.json` has `"status": "ok"` and recent timestamp.
+2. `logs/scraper.log` has final `Run summary` and `Supabase sync: enabled`.
+3. Dashboard tabs load without API errors.
+4. `output/Extracted_bids.xlsx` and `output/doubtful_bids.xlsx` are updated.
+
 ## Render Deployment (Dashboard)
 
 Deploy the dashboard as a separate Render web service.
@@ -117,6 +127,27 @@ Deploy the dashboard as a separate Render web service.
    - `SUPABASE_DB_NAME=postgres`
    - `SUPABASE_DB_USER=postgres.rigivunjxinvyzlzctoj`
    - `SUPABASE_DB_PASSWORD=...`
+
+### Health endpoint
+
+The dashboard exposes `GET /api/health` for uptime and DB reachability checks.
+The keep-alive GitHub workflow pings this endpoint every 10 minutes.
+
+## Recovery Runbook
+
+If dashboard rows look stale or missing:
+
+1. Check `data/last_run_status.json` and `logs/scraper.log` for extractor errors.
+2. Run extractor manually:
+   ```powershell
+   python main.py
+   ```
+3. If DB was unavailable during run, rerun extractor once DB is healthy (queue-first sync retries).
+4. If local output exists but DB is empty, run one-time recovery:
+   ```powershell
+   python tools/backfill_dashboard_from_excel.py
+   ```
+5. Refresh dashboard and verify `/api/health` returns `{"status":"ok", ...}`.
 
 ## Notes
 

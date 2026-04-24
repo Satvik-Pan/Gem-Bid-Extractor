@@ -12,4 +12,5 @@ jobs:
       - name: Ping dashboard
         run: |
           set -euo pipefail
-          curl -fsS "https://gem-bid-extractor.onrender.com/api/bids?tab=extracted" >/dev/null
+          response="$(curl -fsS "https://gem-bid-extractor.onrender.com/api/health")"
+          python -c "import json,sys; data=json.loads(sys.argv[1]); assert data.get('status')=='ok', data" "$response"

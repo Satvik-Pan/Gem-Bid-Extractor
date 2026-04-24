@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from .anthropic_llm import AnthropicClaudeClassifier
@@ -18,6 +19,20 @@ from .storage import BidTracker
 from .supabase_store import SupabaseStore
 
 logger = logging.getLogger(__name__)
+_NON_WORD_BOUNDARY = r"[^a-z0-9]+"
+_WEAK_EXCLUSION_TERMS = {"next", "threat", "internet", "domain", "edge", "gateway"}
+
+
+def _compile_keyword_pattern(term: str) -> re.Pattern[str]:
+    chunks = [re.escape(chunk) for chunk in re.split(_NON_WORD_BOUNDARY, term.lower()) if chunk]
+    if not chunks:
+        return re.compile(r"$^")
+    pattern = r"\b" + r"\s+".join(chunks) + r"\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+_INCLUSION_PATTERNS = [(term, _compile_keyword_pattern(term)) for term in INCLUSION_KEYWORDS]
+_EXCLUSION_PATTERNS = [(term, _compile_keyword_pattern(term)) for term in EXCLUSION_KEYWORDS]
 
 
 def _dedupe_by_ref(bids: list[dict]) -> list[dict]:
@@ -56,16 +71,20 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
     return list(merged.values())
 
 
-def _keyword_flags(bid: dict) -> tuple[bool, bool]:
+def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
     text_parts = [
         str(bid.get("Name", "")),
         str(bid.get("Description", "")),
         str(bid.get("Category", "")),
     ]
-    haystack = " ".join(text_parts).lower()
-    has_inclusion = any(term in haystack for term in INCLUSION_KEYWORDS)
-    has_exclusion = any(term in haystack for term in EXCLUSION_KEYWORDS)
-    return has_inclusion, has_exclusion
+    haystack = " ".join(text_parts).lower().strip()
+    inclusion_hits = [term for term, pattern in _INCLUSION_PATTERNS if pattern.search(haystack)]
+    exclusion_hits = [term for term, pattern in _EXCLUSION_PATTERNS if pattern.search(haystack)]
+    strong_exclusion_hits = [term for term in exclusion_hits if term not in _WEAK_EXCLUSION_TERMS]
+    weak_exclusion_hits = [term for term in exclusion_hits if term in _WEAK_EXCLUSION_TERMS]
+    has_inclusion = bool(inclusion_hits)
+    has_exclusion = bool(strong_exclusion_hits) or len(weak_exclusion_hits) >= 2
+    return has_inclusion, has_exclusion, inclusion_hits, exclusion_hits
 
 
 def run() -> dict:
@@ -126,7 +145,8 @@ def run() -> dict:
         ref = str(bid.get("Reference No.", "")).strip()
         decision = prefilter_map.get(ref)
         if decision is None:
-            raise RuntimeError(f"Missing LLM prefilter decision for bid {ref}")
+            logger.warning("Missing LLM prefilter decision for %s; defaulting to keep", ref)
+            decision = {"decision": "YES", "confidence": 0.5}
         keep = decision.get("decision") == "YES" or float(decision.get("confidence", 0.0)) >= 0.4
         if keep:
             bid["Prefilter Confidence"] = round(float(decision.get("confidence", 0.0)), 3)
@@ -140,8 +160,9 @@ def run() -> dict:
     llm_candidates: list[dict] = []
     excluded_dropped: list[dict] = []
     for bid in combined_candidates:
-        _, has_exclusion = _keyword_flags(bid)
+        _, has_exclusion, _, exclusion_hits = _keyword_flags(bid)
         if has_exclusion:
+            bid["Exclusion Hits"] = ", ".join(exclusion_hits[:6])
             excluded_dropped.append(bid)
             continue
         llm_candidates.append(bid)
@@ -155,17 +176,24 @@ def run() -> dict:
     relevant: list[dict] = []
     doubtful: list[dict] = []
     rejected: list[dict] = []
+    final_fallback_count = 0
 
     for bid in llm_candidates:
         ref = str(bid.get("Reference No.", "")).strip()
         final_vote = final_map.get(ref)
         if final_vote is None:
-            raise RuntimeError(f"Missing final LLM classification for bid {ref}")
+            final_fallback_count += 1
+            logger.warning("Missing final LLM classification for %s; defaulting to DOUBTFUL", ref)
+            final_vote = {
+                "category": "DOUBTFUL",
+                "confidence": 0.35,
+                "reason": "Fallback category: missing final LLM response",
+            }
 
         category = str(final_vote.get("category", "REJECTED")).upper()
         confidence = round(float(final_vote.get("confidence", 0.0)), 3)
         reason = str(final_vote.get("reason", ""))
-        has_inclusion, has_exclusion = _keyword_flags(bid)
+        has_inclusion, has_exclusion, inclusion_hits, exclusion_hits = _keyword_flags(bid)
 
         if has_inclusion and not has_exclusion and category != "EXTRACTED":
             category = "EXTRACTED"
@@ -176,6 +204,8 @@ def run() -> dict:
         bid["LLM Reason"] = reason
         bid["Inclusion Match"] = has_inclusion
         bid["Exclusion Match"] = has_exclusion
+        bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
+        bid["Exclusion Hits"] = ", ".join(exclusion_hits[:6])
 
         if category == "EXTRACTED":
             relevant.append(bid)
@@ -205,6 +235,7 @@ def run() -> dict:
 
     logger.info("LLM prefilter coverage: %.2f", prefilter_coverage)
     logger.info("LLM final coverage: %.2f", final_coverage)
+    logger.info("LLM final fallback count: %d", final_fallback_count)
     logger.info("Results -> relevant: %d, doubtful: %d, rejected: %d", len(relevant), len(doubtful), len(rejected))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
@@ -221,5 +252,6 @@ def run() -> dict:
         "merged_candidates": len(combined_candidates),
         "llm_prefilter_coverage": round(prefilter_coverage, 4),
         "llm_final_coverage": round(final_coverage, 4),
+        "llm_final_fallback_count": final_fallback_count,
         "supabase_sync": db_sync_ok,
     }

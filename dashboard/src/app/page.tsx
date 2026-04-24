@@ -24,6 +24,7 @@ export default function Home() {
   const [rows, setRows] = useState<BidRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [pendingActions, setPendingActions] = useState<Record<string, boolean>>({});
 
   const title = useMemo(() => {
     if (tab === "extracted") return "Extracted Bids";
@@ -61,7 +62,23 @@ export default function Home() {
     return () => clearInterval(timer);
   }, [loadRows]);
 
+  const safeExternalUrl = (raw: string): string => {
+    try {
+      const url = new URL(raw);
+      if (url.protocol === "http:" || url.protocol === "https:") {
+        return url.toString();
+      }
+    } catch {
+      // Ignore malformed URL and render plain text.
+    }
+    return "";
+  };
+
   const runAction = async (bidId: string, action: "resolve" | "reject" | "promote") => {
+    if (pendingActions[bidId]) {
+      return;
+    }
+    setPendingActions((prev) => ({ ...prev, [bidId]: true }));
     setError("");
     try {
       const res = await fetch(`/api/bids/${encodeURIComponent(bidId)}/action`, {
@@ -76,6 +93,8 @@ export default function Home() {
       await loadRows();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown action error");
+    } finally {
+      setPendingActions((prev) => ({ ...prev, [bidId]: false }));
     }
   };
 
@@ -129,7 +148,8 @@ export default function Home() {
                 const payload = row.payload || {};
                 const name = String(payload["Name"] || "");
                 const dept = String(payload["Department"] || "");
-                const sourceUrl = String(payload["Source URL"] || "");
+                const sourceUrl = safeExternalUrl(String(payload["Source URL"] || ""));
+                const isPending = Boolean(pendingActions[row.bid_id]);
                 return (
                   <tr key={row.bid_id}>
                     <td className={styles.refCell}>
@@ -150,11 +170,14 @@ export default function Home() {
                         <div className={styles.inlineActions}>
                           <button
                             className={styles.promoteBtn}
+                            disabled={isPending}
                             onClick={() => void runAction(row.bid_id, tab === "doubtful" ? "promote" : "resolve")}
                           >
-                            Tick
+                            {isPending ? "Working..." : "Tick"}
                           </button>
-                          <button className={styles.rejectBtn} onClick={() => void runAction(row.bid_id, "reject")}>Cross</button>
+                          <button className={styles.rejectBtn} disabled={isPending} onClick={() => void runAction(row.bid_id, "reject")}>
+                            {isPending ? "Working..." : "Cross"}
+                          </button>
                         </div>
                       ) : null}
                       {tab === "history" ? (

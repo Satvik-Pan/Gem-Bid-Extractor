@@ -23,11 +23,13 @@ FEEDBACK_FILE = DATA_DIR / "feedback_logs.json"
 THRESHOLDS_FILE = DATA_DIR / "thresholds.json"
 WATCHLIST_FILE = DATA_DIR / "false_negative_watchlist.json"
 LOG_FILE = LOG_DIR / "scraper.log"
+RUN_STATUS_FILE = DATA_DIR / "last_run_status.json"
 SYNC_QUEUE_FILE = DATA_DIR / "db_sync_queue.jsonl"
 DNS_CACHE_FILE = DATA_DIR / "dns_cache.json"
 
 KEYWORDS_FILE = BASE_DIR / "src" / "gem_bid_extractor" / "keywords.csv"
 MAX_PAGES_PER_PIPELINE = 5
+MAX_PAGES_PER_PIPELINE = int(os.environ.get("MAX_PAGES_PER_PIPELINE", str(MAX_PAGES_PER_PIPELINE)))
 
 DEFAULT_INCLUSION_KEYWORDS = [
     "router",

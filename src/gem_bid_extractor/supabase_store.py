@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Iterable
 
 import psycopg2
@@ -65,9 +66,13 @@ class SupabaseStore:
 
     def _save_queue(self, rows: list[dict]) -> None:
         self.queue_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.queue_path.open("w", encoding="utf-8") as fh:
+        temp_path = self.queue_path.with_suffix(f"{self.queue_path.suffix}.tmp")
+        with temp_path.open("w", encoding="utf-8") as fh:
             for row in rows:
                 fh.write(json.dumps(row, ensure_ascii=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        temp_path.replace(self.queue_path)
 
     @staticmethod
     def _dedupe_rows(rows: Iterable[dict]) -> list[dict]:

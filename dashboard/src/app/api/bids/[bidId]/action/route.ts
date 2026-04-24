@@ -20,7 +20,7 @@ export async function PATCH(
 
   try {
     if (action === "resolve") {
-      await pool.query(
+      const result = await pool.query(
         `
           update bid_worklist
           set status = 'RESOLVED', resolved_at = now(), last_seen_at = now()
@@ -28,11 +28,14 @@ export async function PATCH(
         `,
         [bidId]
       );
+      if (!result.rowCount) {
+        return NextResponse.json({ error: "Bid not found or no longer actionable" }, { status: 409 });
+      }
       return NextResponse.json({ ok: true });
     }
 
     if (action === "reject") {
-      await pool.query(
+      const result = await pool.query(
         `
           update bid_worklist
           set status = 'REVIEW_REJECTED', resolved_at = now(), last_seen_at = now(), category = 'REJECTED'
@@ -40,10 +43,13 @@ export async function PATCH(
         `,
         [bidId]
       );
+      if (!result.rowCount) {
+        return NextResponse.json({ error: "Bid not found or no longer actionable" }, { status: 409 });
+      }
       return NextResponse.json({ ok: true });
     }
 
-    await pool.query(
+    const result = await pool.query(
       `
         update bid_worklist
         set category = 'EXTRACTED', status = 'RESOLVED', resolved_at = now(), last_seen_at = now(),
@@ -52,9 +58,12 @@ export async function PATCH(
       `,
       [bidId]
     );
+    if (!result.rowCount) {
+      return NextResponse.json({ error: "Bid not found or no longer actionable" }, { status: 409 });
+    }
     return NextResponse.json({ ok: true });
   } catch (error) {
-    const msg = error instanceof Error ? error.message : "Action failed";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    console.error("PATCH /api/bids/[bidId]/action failed", error);
+    return NextResponse.json({ error: "Action failed" }, { status: 500 });
   }
 }

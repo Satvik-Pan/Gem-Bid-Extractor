@@ -221,6 +221,12 @@
   cursor: pointer;
 }
 
+.rejectBtn:disabled,
+.promoteBtn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .promoteBtn {
   background: #eef9f2;
   color: var(--ok);

@@ -3,9 +3,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { getPool } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
+const VALID_TABS = new Set(["extracted", "doubtful", "history"]);
 
 export async function GET(req: NextRequest) {
   const tab = (req.nextUrl.searchParams.get("tab") || "extracted").toLowerCase();
+  if (!VALID_TABS.has(tab)) {
+    return NextResponse.json({ error: "Invalid tab value" }, { status: 400 });
+  }
 
   const pool = getPool();
   let query = "";
@@ -44,7 +48,7 @@ export async function GET(req: NextRequest) {
     const result = await pool.query(query, params);
     return NextResponse.json({ rows: result.rows });
   } catch (error) {
-    const msg = error instanceof Error ? error.message : "Query failed";
-    return NextResponse.json({ error: msg }, { status: 500 });
+    console.error("GET /api/bids failed", error);
+    return NextResponse.json({ error: "Query failed" }, { status: 500 });
   }
 }

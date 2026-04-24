@@ -148,14 +148,15 @@ class GemScraper:
             "Bid ID": str(_val(doc.get("b_id", ""))),
             "_keyword": keyword,
             "_start_dt": start_raw,
+            "_end_dt": end_raw,
         }
 
     @staticmethod
-    def _within_window(start_dt: Optional[datetime], min_date, max_date) -> bool:
-        if start_dt is None:
+    def _within_window(end_dt: Optional[datetime], min_date, max_date) -> bool:
+        if end_dt is None:
             return True
-        start_date = start_dt.astimezone(timezone.utc).date()
-        return min_date <= start_date <= max_date
+        end_date = end_dt.astimezone(timezone.utc).date()
+        return min_date <= end_date <= max_date
 
     def search_full(self, cutoff: datetime, max_pages: int = MAX_PAGES_PER_PIPELINE) -> list[dict]:
         bids: list[dict] = []
@@ -174,12 +175,12 @@ class GemScraper:
                 bid_id = str(_val(doc.get("b_id", "")))
                 if not bid_id or bid_id in seen_ids:
                     continue
-                start_raw = _val(doc.get("final_start_date_sort", ""))
-                start_dt = _parse_iso(start_raw) if start_raw else None
-                if start_dt and start_dt < cutoff:
+                end_raw = _val(doc.get("final_end_date_sort", ""))
+                end_dt = _parse_iso(end_raw) if end_raw else None
+                if end_dt and end_dt < cutoff:
                     stop = True
                     break
-                if not self._within_window(start_dt, cutoff_date, today_date):
+                if not self._within_window(end_dt, cutoff_date, today_date):
                     continue
                 seen_ids.add(bid_id)
                 bid = self._parse_bid(doc, "")
@@ -191,6 +192,8 @@ class GemScraper:
             page += 1
             time.sleep(random.uniform(*REQUEST_DELAY))
 
+        if page > max_pages:
+            logger.warning("Pipeline full feed hit page cap (%d). Consider increasing MAX_PAGES_PER_PIPELINE.", max_pages)
         logger.info("Fetched %d unique bids from full feed", len(bids))
         return bids
 
@@ -210,12 +213,12 @@ class GemScraper:
                 bid_id = str(_val(doc.get("b_id", "")))
                 if not bid_id or bid_id in seen_ids:
                     continue
-                start_raw = _val(doc.get("final_start_date_sort", ""))
-                start_dt = _parse_iso(start_raw) if start_raw else None
-                if start_dt and start_dt < cutoff:
+                end_raw = _val(doc.get("final_end_date_sort", ""))
+                end_dt = _parse_iso(end_raw) if end_raw else None
+                if end_dt and end_dt < cutoff:
                     stop = True
                     break
-                if not self._within_window(start_dt, cutoff_date, today_date):
+                if not self._within_window(end_dt, cutoff_date, today_date):
                     continue
                 seen_ids.add(bid_id)
                 bid = self._parse_bid(doc, keyword)
@@ -226,6 +229,12 @@ class GemScraper:
                 break
             page += 1
             time.sleep(random.uniform(*REQUEST_DELAY))
+        if page > MAX_PAGES_PER_PIPELINE:
+            logger.warning(
+                "Keyword search '%s' hit page cap (%d). Consider increasing MAX_PAGES_PER_PIPELINE.",
+                keyword,
+                MAX_PAGES_PER_PIPELINE,
+            )
         return bids
 
     def search_all(self, keywords: list[str], cutoff: datetime) -> list[dict]:
