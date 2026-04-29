@@ -13,7 +13,7 @@ echo  %date% %time%
 echo ============================================
 
 :: Run the Python extractor
-python main.py
+python -u main.py
 if %errorlevel% neq 0 (
   echo [ERROR] Extraction failed with code %errorlevel%
   if "%SCHEDULED_MODE%"=="0" pause
