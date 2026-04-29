@@ -10,8 +10,8 @@ if (-not (Test-Path $bat)) {
     throw "run_extractor.bat not found at $bat"
 }
 
-# Create the scheduled task action - run the batch file via cmd
-$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$bat`"" -WorkingDirectory $repo
+# Create the scheduled task action - run in scheduled mode so batch doesn't pause
+$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$bat`" --scheduled" -WorkingDirectory $repo
 
 # Daily trigger at the specified time
 $trigger = New-ScheduledTaskTrigger -Daily -At $RunAt
