@@ -35,5 +35,5 @@ try {
     Write-Output "[auto-git] Pushed to GitHub origin/main successfully."
 } catch {
     Write-Warning "[auto-git] Push to GitHub failed: $($_.Exception.Message)"
-    exit 0
+    exit 1
 }
