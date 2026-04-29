@@ -32,12 +32,11 @@ Rules:
 
 _FINAL_CLASS_PROMPT = """You are the final classifier for Indian government bids.
 Return strict JSON only:
-{"results":[{"ref":"<Reference No.>","category":"EXTRACTED"|"DOUBTFUL"|"REJECTED","confidence":0.0,"reason":"short reason"}]}
+{"results":[{"ref":"<Reference No.>","category":"EXTRACTED"|"DOUBTFUL","confidence":0.0,"reason":"short reason"}]}
 
 Rules:
 - EXTRACTED: strong cybersecurity relevance.
 - DOUBTFUL: partial/ambiguous relevance, needs review.
-- REJECTED: not cybersecurity-related.
 - Return exactly one result per input ref.
 """
 
@@ -249,7 +248,7 @@ class AnthropicClaudeClassifier:
                 category = str(item.get("category", "")).upper()
                 conf = item.get("confidence")
                 reason = str(item.get("reason", "")).strip()
-                if ref and category in {"EXTRACTED", "DOUBTFUL", "REJECTED"}:
+                if ref and category in {"EXTRACTED", "DOUBTFUL"}:
                     try:
                         c_val = float(conf)
                     except (TypeError, ValueError):

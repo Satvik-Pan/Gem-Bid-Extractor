@@ -12,7 +12,6 @@ from .settings import (
     EXCLUSION_KEYWORDS,
     EXCEL_FILE,
     INCLUSION_KEYWORDS,
-    KEYWORDS,
     LOOKBACK_DAYS,
 )
 from .storage import BidTracker
@@ -54,7 +53,7 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
         ref = str(bid.get("Reference No.", "")).strip()
         if not ref:
             continue
-        bid["Pipeline Source"] = "pipeline1_full_llm"
+        bid["Pipeline Source"] = "pipeline2_llm"
         merged[ref] = bid
 
     for bid in keyword_bids:
@@ -62,10 +61,10 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
         if not ref:
             continue
         if ref in merged:
-            src = str(merged[ref].get("Pipeline Source", "pipeline1_full_llm"))
-            merged[ref]["Pipeline Source"] = "pipeline1+pipeline2" if "pipeline2_keyword" not in src else src
+            src = str(merged[ref].get("Pipeline Source", "pipeline2_llm"))
+            merged[ref]["Pipeline Source"] = "pipeline2+pipeline3" if "pipeline3_keyword" not in src else src
             continue
-        bid["Pipeline Source"] = "pipeline2_keyword"
+        bid["Pipeline Source"] = "pipeline3_keyword"
         merged[ref] = bid
 
     return list(merged.values())
@@ -108,77 +107,70 @@ def run() -> dict:
 
     scraper.init_session()
     try:
-        # Pipeline 1: full feed (no keyword filter), then broad LLM prefilter.
-        full_bids = scraper.search_full(cutoff)
-
-        # Pipeline 2: keyword based extraction.
-        keyword_bids = scraper.search_all(KEYWORDS, cutoff)
+        # Pipeline 1: fetch bids from last 3 days, max 5 pages.
+        pipeline1_bids = scraper.search_full(cutoff)
     finally:
         scraper.close()
 
-    full_new = [b for b in _dedupe_by_ref(full_bids) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
-    keyword_new = [b for b in _dedupe_by_ref(keyword_bids) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
+    pipeline1_new = [b for b in _dedupe_by_ref(pipeline1_bids) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
+    logger.info("Pipeline1 fetched new bids: %d", len(pipeline1_new))
 
-    logger.info("Pipeline1 full new bids: %d", len(full_new))
-    logger.info("Pipeline2 keyword new bids: %d", len(keyword_new))
-
-    if not full_new and not keyword_new:
+    if not pipeline1_new:
         writer_main.save([])
         writer_doubtful.save([])
         return {
             "new": 0,
             "relevant": 0,
             "doubtful": 0,
-            "rejected": 0,
-            "prefilter_kept": 0,
-            "merged_candidates": 0,
-            "llm_prefilter_coverage": 1.0,
+            "pipeline1_count": 0,
+            "pipeline2_count": 0,
+            "pipeline3_count": 0,
+            "pipeline4_merged": 0,
             "llm_final_coverage": 1.0,
         }
 
-    logger.info("Pipeline1 prefilter candidates: %d", len(full_new))
-    prefilter_map = llm.prefilter(full_new) if full_new else {}
-    prefilter_coverage = (len(prefilter_map) / len(full_new)) if full_new else 1.0
-
-    prefiltered_full: list[dict] = []
-    for bid in full_new:
+    # Pipeline 2: independent LLM relevance pass over Pipeline 1 output.
+    relevance_map = llm.prefilter(pipeline1_new) if pipeline1_new else {}
+    pipeline2_llm: list[dict] = []
+    for bid in pipeline1_new:
         ref = str(bid.get("Reference No.", "")).strip()
-        decision = prefilter_map.get(ref)
+        decision = relevance_map.get(ref)
         if decision is None:
-            logger.warning("Missing LLM prefilter decision for %s; defaulting to keep", ref)
             decision = {"decision": "YES", "confidence": 0.5}
+            logger.warning("Pipeline2 missing LLM decision for %s; defaulting to YES", ref)
         keep = decision.get("decision") == "YES" or float(decision.get("confidence", 0.0)) >= 0.4
         if keep:
-            bid["Prefilter Confidence"] = round(float(decision.get("confidence", 0.0)), 3)
-            prefiltered_full.append(bid)
+            bid["Pipeline2 LLM Confidence"] = round(float(decision.get("confidence", 0.0)), 3)
+            pipeline2_llm.append(bid)
 
-    logger.info("Pipeline1 kept after broad prefilter: %d", len(prefiltered_full))
+    # Pipeline 3: independent keyword extraction over Pipeline 1 output only.
+    pipeline3_keyword: list[dict] = []
+    for bid in pipeline1_new:
+        has_inclusion, _, inclusion_hits, _ = _keyword_flags(bid)
+        if has_inclusion:
+            bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
+            pipeline3_keyword.append(bid)
 
-    combined_candidates = _merge_candidates(prefiltered_full, keyword_new)
-    combined_candidates = [b for b in _dedupe_by_ref(combined_candidates) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
+    # Pipeline 4: combine + dedupe pipeline2 and pipeline3 results.
+    pipeline4_candidates = _merge_candidates(pipeline2_llm, pipeline3_keyword)
+    pipeline4_candidates = _dedupe_by_ref(pipeline4_candidates)
 
-    llm_candidates: list[dict] = []
-    excluded_dropped: list[dict] = []
-    for bid in combined_candidates:
-        _, has_exclusion, _, exclusion_hits = _keyword_flags(bid)
-        if has_exclusion:
-            bid["Exclusion Hits"] = ", ".join(exclusion_hits[:6])
-            excluded_dropped.append(bid)
-            continue
-        llm_candidates.append(bid)
+    logger.info("Pipeline2 LLM-selected bids: %d", len(pipeline2_llm))
+    logger.info("Pipeline3 keyword-selected bids: %d", len(pipeline3_keyword))
+    logger.info("Pipeline4 merged+deduped bids: %d", len(pipeline4_candidates))
 
-    logger.info("Merged candidates for final classification: %d", len(combined_candidates))
-    logger.info("Excluded bids dropped before final LLM: %d", len(excluded_dropped))
-
-    final_map = llm.final_classify(llm_candidates) if llm_candidates else {}
-    final_coverage = (len(final_map) / len(llm_candidates)) if llm_candidates else 1.0
+    # Pipeline 5: final LLM categorization with in-stage exclusion handling.
+    final_map = llm.final_classify(pipeline4_candidates) if pipeline4_candidates else {}
+    final_coverage = (len(final_map) / len(pipeline4_candidates)) if pipeline4_candidates else 1.0
 
     relevant: list[dict] = []
     doubtful: list[dict] = []
-    rejected: list[dict] = []
+    ignored: list[dict] = []
     final_fallback_count = 0
 
-    for bid in llm_candidates:
+    selected_refs = {str(b.get("Reference No.", "")).strip() for b in pipeline4_candidates}
+
+    for bid in pipeline4_candidates:
         ref = str(bid.get("Reference No.", "")).strip()
         final_vote = final_map.get(ref)
         if final_vote is None:
@@ -190,14 +182,22 @@ def run() -> dict:
                 "reason": "Fallback category: missing final LLM response",
             }
 
-        category = str(final_vote.get("category", "REJECTED")).upper()
+        category = str(final_vote.get("category", "DOUBTFUL")).upper()
         confidence = round(float(final_vote.get("confidence", 0.0)), 3)
         reason = str(final_vote.get("reason", ""))
         has_inclusion, has_exclusion, inclusion_hits, exclusion_hits = _keyword_flags(bid)
 
-        if has_inclusion and not has_exclusion and category != "EXTRACTED":
+        # Exclusion is intentionally handled inside Pipeline 5.
+        if has_exclusion:
+            category = "DOUBTFUL"
+            reason = f"{reason} | Exclusion keyword match forced DOUBTFUL.".strip(" |")
+        elif has_inclusion and category != "EXTRACTED":
             category = "EXTRACTED"
             reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
+
+        if category not in {"EXTRACTED", "DOUBTFUL"}:
+            category = "DOUBTFUL"
+            reason = f"{reason} | Final class normalized to DOUBTFUL.".strip(" |")
 
         bid["Final Category"] = category
         bid["LLM Confidence"] = confidence
@@ -209,15 +209,19 @@ def run() -> dict:
 
         if category == "EXTRACTED":
             relevant.append(bid)
-        elif category == "DOUBTFUL":
-            doubtful.append(bid)
         else:
-            rejected.append(bid)
+            doubtful.append(bid)
+
+    # Mark non-selected Pipeline1 bids as ignored to avoid infinite reprocessing.
+    for bid in pipeline1_new:
+        ref = str(bid.get("Reference No.", "")).strip()
+        if ref and ref not in selected_refs:
+            ignored.append(bid)
 
     added_main = writer_main.save(relevant)
     added_doubtful = writer_doubtful.save(doubtful)
 
-    db_sync_ok = db.sync_with_retry([*relevant, *doubtful, *rejected])
+    db_sync_ok = db.sync_with_retry([*relevant, *doubtful])
     if db_sync_ok:
         logger.info("Supabase sync: enabled")
     else:
@@ -227,30 +231,25 @@ def run() -> dict:
         tracker.mark(bid.get("Reference No.", ""), "extracted", 100, bid.get("LLM Confidence", 0))
     for bid in doubtful:
         tracker.mark(bid.get("Reference No.", ""), "doubtful", 60, bid.get("LLM Confidence", 0))
-    for bid in rejected:
-        tracker.mark(bid.get("Reference No.", ""), "rejected", 0, bid.get("LLM Confidence", 0))
-    for bid in excluded_dropped:
-        tracker.mark(bid.get("Reference No.", ""), "excluded", 0, 0)
+    for bid in ignored:
+        tracker.mark(bid.get("Reference No.", ""), "ignored", 0, 0)
     tracker.save()
 
-    logger.info("LLM prefilter coverage: %.2f", prefilter_coverage)
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
-    logger.info("Results -> relevant: %d, doubtful: %d, rejected: %d", len(relevant), len(doubtful), len(rejected))
+    logger.info("Results -> relevant: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
     return {
-        "new": len(combined_candidates),
-        "llm_candidates": len(llm_candidates),
-        "excluded_dropped": len(excluded_dropped),
+        "new": len(pipeline4_candidates),
+        "pipeline1_count": len(pipeline1_new),
+        "pipeline2_count": len(pipeline2_llm),
+        "pipeline3_count": len(pipeline3_keyword),
+        "pipeline4_merged": len(pipeline4_candidates),
         "relevant": len(relevant),
         "doubtful": len(doubtful),
-        "rejected": len(rejected),
         "saved_main": added_main,
         "saved_doubtful": added_doubtful,
-        "prefilter_kept": len(prefiltered_full),
-        "merged_candidates": len(combined_candidates),
-        "llm_prefilter_coverage": round(prefilter_coverage, 4),
         "llm_final_coverage": round(final_coverage, 4),
         "llm_final_fallback_count": final_fallback_count,
         "supabase_sync": db_sync_ok,

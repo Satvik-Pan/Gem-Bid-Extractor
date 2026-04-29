@@ -140,16 +140,15 @@ class SupabaseStore:
                     if not bid_id or not ref:
                         continue
 
-                    incoming_category = str(bid.get("Final Category", "REJECTED")).upper()
+                    incoming_category = str(bid.get("Final Category", "DOUBTFUL")).upper()
+                    if incoming_category not in {"EXTRACTED", "DOUBTFUL"}:
+                        incoming_category = "DOUBTFUL"
                     confidence = float(bid.get("LLM Confidence", 0.0) or 0.0)
                     reason = str(bid.get("LLM Reason", ""))
                     pipeline_source = str(bid.get("Pipeline Source", ""))
                     payload = json.dumps(bid)
 
                     status = "ACTIVE"
-                    if incoming_category == "REJECTED":
-                        # Auto-rejected rows are hidden from ops queues/history.
-                        status = "AUTO_REJECTED"
 
                     cur.execute("select status from bid_worklist where bid_id = %s", (bid_id,))
                     row = cur.fetchone()

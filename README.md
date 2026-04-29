@@ -1,16 +1,17 @@
 # Gem Bid Extractor
 
-Cybersecurity bid extractor with two independent GEM pipelines, strict Anthropic classification, append-only Excel outputs, and a Supabase-backed operations dashboard.
+Cybersecurity bid extractor with a 5-stage pipeline, strict Anthropic classification, append-only Excel outputs, and a Supabase-backed operations dashboard.
 
 ## Architecture
 
-1. Pipeline 1: full GEM feed from the last 3 days, then broad LLM prefilter.
-2. Pipeline 2: keyword-based GEM search.
-3. Merge and dedupe by reference number.
-4. Final strict Anthropic classification into `EXTRACTED`, `DOUBTFUL`, or `REJECTED`.
-5. Append-only Excel writes for extracted and doubtful rows.
-6. Queue-first Supabase sync so DB failure does not stop extraction.
-7. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
+1. Pipeline 1: fetch GEM bids for last 3 days (today plus previous 2 days), capped at 5 pages.
+2. Pipeline 2: independent LLM relevance pass over all Pipeline 1 bids.
+3. Pipeline 3: independent inclusion-keyword extraction over Pipeline 1 bids.
+4. Pipeline 4: combine Pipeline 2 and Pipeline 3 outputs, then dedupe by reference.
+5. Pipeline 5: final LLM categorization into `EXTRACTED` and `DOUBTFUL` (with exclusion handling inside this stage).
+6. Append-only Excel writes for extracted and doubtful rows.
+7. Queue-first Supabase sync so DB failure does not stop extraction.
+8. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
 
 ## Project Structure
 
@@ -78,12 +79,12 @@ Then refresh the dashboard URL.
 
 ## Daily Automation (Windows Task Scheduler)
 
-The extractor runs automatically every day at **11:00 AM** via Windows Task Scheduler.
+The extractor runs automatically every day at **12:00 PM** via Windows Task Scheduler.
 
 ### Register the scheduled task:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "11:00"
+powershell -ExecutionPolicy Bypass -File .\tools\register_daily_task.ps1 -TaskName GemBidExtractorDaily -RunAt "12:00"
 ```
 
 ### Verify the task:
@@ -94,7 +95,7 @@ Get-ScheduledTask -TaskName GemBidExtractorDaily | Format-List
 
 ### What the daily run does:
 
-1. GEM extraction (last 3 days of bids) and dual pipeline classification.
+1. GEM extraction and 5-stage classification flow (P1 fetch -> P2 LLM -> P3 keyword -> P4 merge -> P5 final).
 2. Excel append update (`output/Extracted_bids.xlsx`, `output/doubtful_bids.xlsx`).
 3. Supabase sync for dashboard tabs.
 4. Git auto-commit + GitHub push (when changes exist).
