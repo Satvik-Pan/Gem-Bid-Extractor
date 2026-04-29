@@ -74,7 +74,7 @@ export default function Home() {
     return "";
   };
 
-  const runAction = async (bidId: string, action: "resolve" | "reject" | "promote") => {
+  const runAction = async (bidId: string, action: "resolve" | "reject" | "promote", reason: string) => {
     if (pendingActions[bidId]) {
       return;
     }
@@ -84,7 +84,7 @@ export default function Home() {
       const res = await fetch(`/api/bids/${encodeURIComponent(bidId)}/action`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ action, reason }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -104,6 +104,17 @@ export default function Home() {
     } catch {
       // Clipboard API can fail on some browsers/security contexts.
     }
+  };
+
+  const askDecisionReason = (actionLabel: "Tick" | "Cross"): string | null => {
+    const input = window.prompt(`Enter reason for ${actionLabel}:`);
+    if (input === null) return null;
+    const reason = input.trim();
+    if (!reason) {
+      setError("Reason is required to continue.");
+      return null;
+    }
+    return reason;
   };
 
   return (
@@ -158,6 +169,10 @@ export default function Home() {
                 const dept = String(payload["Department"] || "");
                 const sourceUrl = safeExternalUrl(String(payload["Source URL"] || ""));
                 const isPending = Boolean(pendingActions[row.bid_id]);
+                const displayReason =
+                  tab === "history"
+                    ? String(payload["Review Reason"] || row.llm_reason || "-")
+                    : (row.llm_reason || "-");
                 return (
                   <tr key={row.bid_id}>
                     <td className={styles.refCell}>
@@ -178,18 +193,30 @@ export default function Home() {
                     <td>{name}</td>
                     <td>{dept}</td>
                     <td>{row.llm_confidence != null ? row.llm_confidence.toFixed(3) : "-"}</td>
-                    <td>{row.llm_reason || "-"}</td>
+                    <td>{displayReason}</td>
                     <td>
                       {tab === "extracted" || tab === "doubtful" ? (
                         <div className={styles.inlineActions}>
                           <button
                             className={styles.promoteBtn}
                             disabled={isPending}
-                            onClick={() => void runAction(row.bid_id, tab === "doubtful" ? "promote" : "resolve")}
+                            onClick={() => {
+                              const reason = askDecisionReason("Tick");
+                              if (!reason) return;
+                              void runAction(row.bid_id, tab === "doubtful" ? "promote" : "resolve", reason);
+                            }}
                           >
                             {isPending ? "Working..." : "Tick"}
                           </button>
-                          <button className={styles.rejectBtn} disabled={isPending} onClick={() => void runAction(row.bid_id, "reject")}>
+                          <button
+                            className={styles.rejectBtn}
+                            disabled={isPending}
+                            onClick={() => {
+                              const reason = askDecisionReason("Cross");
+                              if (!reason) return;
+                              void runAction(row.bid_id, "reject", reason);
+                            }}
+                          >
                             {isPending ? "Working..." : "Cross"}
                           </button>
                         </div>
