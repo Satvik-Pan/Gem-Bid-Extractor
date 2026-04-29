@@ -103,6 +103,23 @@ Get-ScheduledTask -TaskName GemBidExtractorDaily | Format-List
 
 Open **Task Scheduler** (`taskschd.msc`) → find `GemBidExtractorDaily` → check the **History** tab and **Last Run Result** column.
 
+## Render Keep-Awake (Dual Protection)
+
+To reduce Render free-tier sleep behavior, two keepalive paths are configured:
+
+1. GitHub Actions workflow every 5 minutes (`.github/workflows/keep-render-awake.yml`).
+2. Optional local Windows task every 10 minutes:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\tools\register_render_keepalive_task.ps1 -IntervalMinutes 10
+   ```
+
+Manual ping test:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\keep_render_awake.ps1
+```
+
 ### Daily validation checklist
 
 After the scheduled run, verify:

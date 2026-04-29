@@ -98,6 +98,14 @@ export default function Home() {
     }
   };
 
+  const copyRefToClipboard = async (ref: string) => {
+    try {
+      await navigator.clipboard.writeText(ref);
+    } catch {
+      // Clipboard API can fail on some browsers/security contexts.
+    }
+  };
+
   return (
     <div className={styles.pageShell}>
       <header className={styles.headerCard}>
@@ -154,7 +162,13 @@ export default function Home() {
                   <tr key={row.bid_id}>
                     <td className={styles.refCell}>
                       {sourceUrl ? (
-                        <a className={styles.refLink} href={sourceUrl} target="_blank" rel="noreferrer">
+                        <a
+                          className={styles.refLink}
+                          href={sourceUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={() => void copyRefToClipboard(row.reference_no)}
+                        >
                           {row.reference_no}
                         </a>
                       ) : (
