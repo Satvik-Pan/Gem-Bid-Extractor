@@ -19,12 +19,20 @@ type BidRow = {
   resolved_at: string | null;
 };
 
+type PendingDecision = {
+  bidId: string;
+  action: "resolve" | "reject" | "promote";
+  label: "Tick" | "Cross";
+};
+
 export default function Home() {
   const [tab, setTab] = useState<TabKey>("extracted");
   const [rows, setRows] = useState<BidRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [pendingActions, setPendingActions] = useState<Record<string, boolean>>({});
+  const [decisionModal, setDecisionModal] = useState<PendingDecision | null>(null);
+  const [decisionReason, setDecisionReason] = useState("");
 
   const title = useMemo(() => {
     if (tab === "extracted") return "Extracted Bids";
@@ -106,15 +114,21 @@ export default function Home() {
     }
   };
 
-  const askDecisionReason = (actionLabel: "Tick" | "Cross"): string | null => {
-    const input = window.prompt(`Enter reason for ${actionLabel}:`);
-    if (input === null) return null;
-    const reason = input.trim();
+  const openDecisionModal = (bidId: string, action: "resolve" | "reject" | "promote", label: "Tick" | "Cross") => {
+    setDecisionReason("");
+    setDecisionModal({ bidId, action, label });
+  };
+
+  const submitDecision = async () => {
+    if (!decisionModal) return;
+    const reason = decisionReason.trim();
     if (!reason) {
       setError("Reason is required to continue.");
-      return null;
+      return;
     }
-    return reason;
+    await runAction(decisionModal.bidId, decisionModal.action, reason);
+    setDecisionModal(null);
+    setDecisionReason("");
   };
 
   return (
@@ -201,9 +215,7 @@ export default function Home() {
                             className={styles.promoteBtn}
                             disabled={isPending}
                             onClick={() => {
-                              const reason = askDecisionReason("Tick");
-                              if (!reason) return;
-                              void runAction(row.bid_id, tab === "doubtful" ? "promote" : "resolve", reason);
+                              openDecisionModal(row.bid_id, tab === "doubtful" ? "promote" : "resolve", "Tick");
                             }}
                           >
                             {isPending ? "Working..." : "Tick"}
@@ -212,9 +224,7 @@ export default function Home() {
                             className={styles.rejectBtn}
                             disabled={isPending}
                             onClick={() => {
-                              const reason = askDecisionReason("Cross");
-                              if (!reason) return;
-                              void runAction(row.bid_id, "reject", reason);
+                              openDecisionModal(row.bid_id, "reject", "Cross");
                             }}
                           >
                             {isPending ? "Working..." : "Cross"}
@@ -234,6 +244,29 @@ export default function Home() {
           </table>
         </div>
       </main>
+      {decisionModal ? (
+        <div className={styles.modalBackdrop}>
+          <div className={styles.modalCard}>
+            <h3 className={styles.modalTitle}>Reason for {decisionModal.label}</h3>
+            <textarea
+              className={styles.modalTextarea}
+              value={decisionReason}
+              onChange={(e) => setDecisionReason(e.target.value)}
+              placeholder="Write reason..."
+              rows={4}
+              autoFocus
+            />
+            <div className={styles.modalActions}>
+              <button className={styles.modalCancelBtn} onClick={() => setDecisionModal(null)}>
+                Cancel
+              </button>
+              <button className={styles.modalSubmitBtn} onClick={() => void submitDecision()}>
+                Submit
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

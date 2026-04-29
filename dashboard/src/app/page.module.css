@@ -252,6 +252,66 @@
   color: #c23b3b;
 }
 
+.modalBackdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(14, 22, 33, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modalCard {
+  width: min(560px, 92vw);
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.2);
+}
+
+.modalTitle {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+
+.modalTextarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: inherit;
+  resize: vertical;
+}
+
+.modalActions {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.modalCancelBtn,
+.modalSubmitBtn {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.modalCancelBtn {
+  background: #f8fafc;
+  color: var(--text-1);
+}
+
+.modalSubmitBtn {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
 @media (max-width: 900px) {
   .headerCard {
     flex-direction: column;
