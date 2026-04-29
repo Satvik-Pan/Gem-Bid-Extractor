@@ -105,6 +105,7 @@ def run() -> dict:
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(days=LOOKBACK_DAYS - 1)
 
+    logger.info("Pipeline 1/5: Fetching GEM bids (last 3 days, max 5 pages)")
     scraper.init_session()
     try:
         # Pipeline 1: fetch bids from last 3 days, max 5 pages.
@@ -113,23 +114,10 @@ def run() -> dict:
         scraper.close()
 
     pipeline1_new = [b for b in _dedupe_by_ref(pipeline1_bids) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
-    logger.info("Pipeline1 fetched new bids: %d", len(pipeline1_new))
-
-    if not pipeline1_new:
-        writer_main.save([])
-        writer_doubtful.save([])
-        return {
-            "new": 0,
-            "relevant": 0,
-            "doubtful": 0,
-            "pipeline1_count": 0,
-            "pipeline2_count": 0,
-            "pipeline3_count": 0,
-            "pipeline4_merged": 0,
-            "llm_final_coverage": 1.0,
-        }
+    logger.info("Pipeline 1/5 complete: %d new bids", len(pipeline1_new))
 
     # Pipeline 2: independent LLM relevance pass over Pipeline 1 output.
+    logger.info("Pipeline 2/5: Running independent LLM relevance over Pipeline 1 output")
     relevance_map = llm.prefilter(pipeline1_new) if pipeline1_new else {}
     pipeline2_llm: list[dict] = []
     for bid in pipeline1_new:
@@ -142,24 +130,26 @@ def run() -> dict:
         if keep:
             bid["Pipeline2 LLM Confidence"] = round(float(decision.get("confidence", 0.0)), 3)
             pipeline2_llm.append(bid)
+    logger.info("Pipeline 2/5 complete: %d selected bids", len(pipeline2_llm))
 
     # Pipeline 3: independent keyword extraction over Pipeline 1 output only.
+    logger.info("Pipeline 3/5: Running independent keyword extraction over Pipeline 1 output")
     pipeline3_keyword: list[dict] = []
     for bid in pipeline1_new:
         has_inclusion, _, inclusion_hits, _ = _keyword_flags(bid)
         if has_inclusion:
             bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
             pipeline3_keyword.append(bid)
+    logger.info("Pipeline 3/5 complete: %d selected bids", len(pipeline3_keyword))
 
     # Pipeline 4: combine + dedupe pipeline2 and pipeline3 results.
+    logger.info("Pipeline 4/5: Combining Pipeline 2 and Pipeline 3, then deduping")
     pipeline4_candidates = _merge_candidates(pipeline2_llm, pipeline3_keyword)
     pipeline4_candidates = _dedupe_by_ref(pipeline4_candidates)
-
-    logger.info("Pipeline2 LLM-selected bids: %d", len(pipeline2_llm))
-    logger.info("Pipeline3 keyword-selected bids: %d", len(pipeline3_keyword))
-    logger.info("Pipeline4 merged+deduped bids: %d", len(pipeline4_candidates))
+    logger.info("Pipeline 4/5 complete: %d merged+deduped bids", len(pipeline4_candidates))
 
     # Pipeline 5: final LLM categorization with in-stage exclusion handling.
+    logger.info("Pipeline 5/5: Running final LLM categorization (EXTRACTED/DOUBTFUL)")
     final_map = llm.final_classify(pipeline4_candidates) if pipeline4_candidates else {}
     final_coverage = (len(final_map) / len(pipeline4_candidates)) if pipeline4_candidates else 1.0
 
@@ -237,7 +227,7 @@ def run() -> dict:
 
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
-    logger.info("Results -> relevant: %d, doubtful: %d", len(relevant), len(doubtful))
+    logger.info("Pipeline 5/5 complete -> extracted: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
     return {
