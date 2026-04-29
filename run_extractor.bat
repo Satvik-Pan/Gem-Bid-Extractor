@@ -25,9 +25,13 @@ echo.
 echo Running auto git sync to GitHub...
 powershell -ExecutionPolicy Bypass -File "%~dp0tools\auto_git_push.ps1"
 if %errorlevel% neq 0 (
-  echo [ERROR] Auto git sync failed with code %errorlevel%
-  if "%SCHEDULED_MODE%"=="0" pause
-  exit /b %errorlevel%
+  if "%SCHEDULED_MODE%"=="1" (
+    echo [WARN] Auto git sync failed with code %errorlevel% but extractor run completed.
+  ) else (
+    echo [ERROR] Auto git sync failed with code %errorlevel%
+    pause
+    exit /b %errorlevel%
+  )
 )
 
 echo.
