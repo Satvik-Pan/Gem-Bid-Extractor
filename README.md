@@ -4,14 +4,15 @@ Cybersecurity bid extractor with a 5-stage pipeline, strict Anthropic classifica
 
 ## Architecture
 
-1. Pipeline 1: fetch GEM bids from the first 5 pages of `all-bids` (no date-window filtering).
-2. Pipeline 2: independent LLM relevance pass over all Pipeline 1 bids.
-3. Pipeline 3: independent inclusion-keyword extraction over Pipeline 1 bids.
-4. Pipeline 4: combine Pipeline 2 and Pipeline 3 outputs, then dedupe by reference.
-5. Pipeline 5: final LLM categorization into `EXTRACTED` and `DOUBTFUL`, then deterministic hard rejects (exclusion-hit or low-confidence) and strict doubtful retention.
-6. Append-only Excel writes for extracted and doubtful rows.
-7. Queue-first Supabase sync so DB failure does not stop extraction.
-8. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
+1. Pipeline 1: fetch GEM bids from the first 5 pages of `all-bids` with `Bid-Start-Date-Latest`, keep actionable `Bid No` entries, and exclude RA/non-actionable rows.
+2. Pipeline 1 enrichment: open each Bid No page with Selenium, resolve/download bid PDF, and extract full text.
+3. Pipeline 2: independent LLM relevance pass over PDF-backed bid content.
+4. Pipeline 3: independent inclusion-keyword extraction over full PDF text.
+5. Pipeline 4: combine Pipeline 2 and Pipeline 3 outputs, then dedupe by reference.
+6. Pipeline 5: final LLM categorization into `EXTRACTED` and `DOUBTFUL`, then deterministic hard rejects (exclusion-hit or low-confidence) and strict doubtful retention.
+7. Append-only Excel writes for extracted and doubtful rows.
+8. Queue-first Supabase sync so DB failure does not stop extraction.
+9. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
 
 ## Project Structure
 

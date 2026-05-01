@@ -10,7 +10,7 @@ from .settings import (
     DOUBTFUL_FILE,
     EXCLUSION_KEYWORDS,
     EXCEL_FILE,
-    FINAL_HIGH_CONFIDENCE_OVERRIDE,
+    FINAL_DOUBTFUL_MIN_CONFIDENCE,
     FINAL_LOW_CONFIDENCE_REJECT,
     INCLUSION_KEYWORDS,
 )
@@ -75,6 +75,7 @@ def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
         str(bid.get("Name", "")),
         str(bid.get("Description", "")),
         str(bid.get("Category", "")),
+        str(bid.get("PDF Text", "")),
     ]
     haystack = " ".join(text_parts).lower().strip()
     inclusion_hits = [term for term, pattern in _INCLUSION_PATTERNS if pattern.search(haystack)]
@@ -122,13 +123,22 @@ def run() -> dict:
         scraper.close()
 
     pipeline1_new = [b for b in _dedupe_by_ref(pipeline1_bids) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
+    pdf_stats = scraper.enrich_with_pdf_text(pipeline1_new)
+    pipeline1_pdf_ready = [b for b in pipeline1_new if str(b.get("PDF Text", "")).strip()]
     logger.info("Pipeline 1/5 complete: %d new bids", len(pipeline1_new))
+    logger.info(
+        "Pipeline 1/5 PDF status -> downloaded: %d, failed: %d, skipped: %d, ready: %d",
+        pdf_stats["downloaded"],
+        pdf_stats["failed"],
+        pdf_stats["skipped"],
+        len(pipeline1_pdf_ready),
+    )
 
     # Pipeline 2: independent LLM relevance pass over Pipeline 1 output.
     logger.info("Pipeline 2/5: Running independent LLM relevance over Pipeline 1 output")
-    relevance_map = llm.prefilter(pipeline1_new) if pipeline1_new else {}
+    relevance_map = llm.prefilter(pipeline1_pdf_ready) if pipeline1_pdf_ready else {}
     pipeline2_llm: list[dict] = []
-    for bid in pipeline1_new:
+    for bid in pipeline1_pdf_ready:
         ref = str(bid.get("Reference No.", "")).strip()
         decision = relevance_map.get(ref)
         if decision is None:
@@ -143,7 +153,7 @@ def run() -> dict:
     # Pipeline 3: independent keyword extraction over Pipeline 1 output only.
     logger.info("Pipeline 3/5: Running independent keyword extraction over Pipeline 1 output")
     pipeline3_keyword: list[dict] = []
-    for bid in pipeline1_new:
+    for bid in pipeline1_pdf_ready:
         has_inclusion, _, inclusion_hits, _ = _keyword_flags(bid)
         if has_inclusion:
             bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
@@ -193,16 +203,15 @@ def run() -> dict:
             rejected_by_exclusion += 1
             ignored.append(bid)
             continue
-        if confidence < FINAL_LOW_CONFIDENCE_REJECT:
-            rejected_by_low_confidence += 1
-            ignored.append(bid)
-            continue
-
         # Retention logic after hard rejects.
         if has_inclusion and category != "EXTRACTED":
             category = "EXTRACTED"
             reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
-        if category == "DOUBTFUL" and not has_inclusion and confidence < FINAL_HIGH_CONFIDENCE_OVERRIDE:
+        if not has_inclusion and confidence < FINAL_LOW_CONFIDENCE_REJECT:
+            rejected_by_low_confidence += 1
+            ignored.append(bid)
+            continue
+        if category == "DOUBTFUL" and not has_inclusion and confidence < FINAL_DOUBTFUL_MIN_CONFIDENCE:
             rejected_doubtful_without_signal += 1
             ignored.append(bid)
             continue
@@ -263,6 +272,10 @@ def run() -> dict:
     return {
         "new": len(pipeline4_candidates),
         "pipeline1_count": len(pipeline1_new),
+        "pipeline1_pdf_ready": len(pipeline1_pdf_ready),
+        "pdf_downloaded": pdf_stats["downloaded"],
+        "pdf_failed": pdf_stats["failed"],
+        "pdf_skipped": pdf_stats["skipped"],
         "pipeline2_count": len(pipeline2_llm),
         "pipeline3_count": len(pipeline3_keyword),
         "pipeline4_merged": len(pipeline4_candidates),

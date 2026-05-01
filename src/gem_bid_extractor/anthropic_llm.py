@@ -94,12 +94,18 @@ class AnthropicClaudeClassifier:
         desc = str(bid.get("Description", ""))
         if len(desc) > 140:
             desc = desc[:140]
+        pdf_text = str(bid.get("PDF Text", ""))
+        if len(pdf_text) > 1800:
+            pdf_text = pdf_text[:1800]
         return (
             f"Ref: {bid.get('Reference No.', '')}\n"
+            f"Bid No: {bid.get('Bid No.', '')}\n"
+            f"RA No: {bid.get('RA No.', '')}\n"
             f"Category: {bid.get('Category', '')}\n"
             f"Title: {bid.get('Name', '')}\n"
             f"Description: {desc}\n"
-            f"Department: {bid.get('Department', '')}"
+            f"Department: {bid.get('Department', '')}\n"
+            f"PDF Extract: {pdf_text}"
         )
 
     @staticmethod

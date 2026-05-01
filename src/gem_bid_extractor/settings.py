@@ -15,6 +15,8 @@ LOG_DIR = BASE_DIR / "logs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+PDF_CACHE_DIR = DATA_DIR / "pdf_cache"
+PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 EXCEL_FILE = OUTPUT_DIR / "Extracted_bids.xlsx"
 DOUBTFUL_FILE = OUTPUT_DIR / "doubtful_bids.xlsx"
@@ -101,8 +103,11 @@ LOOKBACK_DAYS = 3
 REQUEST_DELAY = (1.0, 2.2)
 MAX_RETRIES = 3
 SESSION_REFRESH_EVERY = 100
-FINAL_LOW_CONFIDENCE_REJECT = float(os.environ.get("FINAL_LOW_CONFIDENCE_REJECT", "0.45"))
-FINAL_HIGH_CONFIDENCE_OVERRIDE = float(os.environ.get("FINAL_HIGH_CONFIDENCE_OVERRIDE", "0.9"))
+PDF_FETCH_TIMEOUT_SECONDS = int(os.environ.get("PDF_FETCH_TIMEOUT_SECONDS", "25"))
+PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
+SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
+FINAL_LOW_CONFIDENCE_REJECT = float(os.environ.get("FINAL_LOW_CONFIDENCE_REJECT", "0.12"))
+FINAL_DOUBTFUL_MIN_CONFIDENCE = float(os.environ.get("FINAL_DOUBTFUL_MIN_CONFIDENCE", "0.4"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
