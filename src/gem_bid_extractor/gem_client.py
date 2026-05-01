@@ -158,11 +158,9 @@ class GemScraper:
         end_date = end_dt.astimezone(timezone.utc).date()
         return min_date <= end_date <= max_date
 
-    def search_full(self, cutoff: datetime, max_pages: int = MAX_PAGES_PER_PIPELINE) -> list[dict]:
+    def search_full(self, max_pages: int = MAX_PAGES_PER_PIPELINE) -> list[dict]:
         bids: list[dict] = []
         seen_ids: set[str] = set()
-        cutoff_date = cutoff.astimezone(timezone.utc).date()
-        today_date = datetime.now(timezone.utc).date()
         page = 1
         while page <= max_pages:
             data = self._search_page("", page)
@@ -170,25 +168,15 @@ class GemScraper:
             if not docs:
                 break
 
-            stop = False
             for doc in docs:
                 bid_id = str(_val(doc.get("b_id", "")))
                 if not bid_id or bid_id in seen_ids:
-                    continue
-                end_raw = _val(doc.get("final_end_date_sort", ""))
-                end_dt = _parse_iso(end_raw) if end_raw else None
-                if end_dt and end_dt < cutoff:
-                    stop = True
-                    break
-                if not self._within_window(end_dt, cutoff_date, today_date):
                     continue
                 seen_ids.add(bid_id)
                 bid = self._parse_bid(doc, "")
                 bid["_pipeline"] = "full"
                 bids.append(bid)
 
-            if stop:
-                break
             page += 1
             time.sleep(random.uniform(*REQUEST_DELAY))
 

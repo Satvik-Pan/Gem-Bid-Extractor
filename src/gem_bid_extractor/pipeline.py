@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
 
 from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
@@ -11,8 +10,9 @@ from .settings import (
     DOUBTFUL_FILE,
     EXCLUSION_KEYWORDS,
     EXCEL_FILE,
+    FINAL_HIGH_CONFIDENCE_OVERRIDE,
+    FINAL_LOW_CONFIDENCE_REJECT,
     INCLUSION_KEYWORDS,
-    LOOKBACK_DAYS,
 )
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
@@ -86,6 +86,17 @@ def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
     return has_inclusion, has_exclusion, inclusion_hits, exclusion_hits
 
 
+def _build_reason(base_reason: str, inclusion_hits: list[str], exclusion_hits: list[str]) -> str:
+    parts: list[str] = []
+    if base_reason.strip():
+        parts.append(base_reason.strip())
+    if inclusion_hits:
+        parts.append(f"Inclusion keywords: {', '.join(inclusion_hits[:6])}.")
+    if exclusion_hits:
+        parts.append(f"Exclusion keywords: {', '.join(exclusion_hits[:6])}.")
+    return " | ".join(parts)[:500]
+
+
 def run() -> dict:
     scraper = GemScraper()
     llm = AnthropicClaudeClassifier()
@@ -102,14 +113,11 @@ def run() -> dict:
     if not llm.enabled:
         raise RuntimeError("Anthropic classifier is disabled. Configure ANTHROPIC_API_KEY/ANTHROPIC_MODEL/ANTHROPIC_BASE_URL in .env")
 
-    now_utc = datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(days=LOOKBACK_DAYS - 1)
-
-    logger.info("Pipeline 1/5: Fetching GEM bids (last 3 days, max 5 pages)")
+    logger.info("Pipeline 1/5: Fetching GEM bids (first 5 pages from all-bids)")
     scraper.init_session()
     try:
-        # Pipeline 1: fetch bids from last 3 days, max 5 pages.
-        pipeline1_bids = scraper.search_full(cutoff)
+        # Pipeline 1: fetch bids from first 5 pages only.
+        pipeline1_bids = scraper.search_full()
     finally:
         scraper.close()
 
@@ -157,6 +165,9 @@ def run() -> dict:
     doubtful: list[dict] = []
     ignored: list[dict] = []
     final_fallback_count = 0
+    rejected_by_exclusion = 0
+    rejected_by_low_confidence = 0
+    rejected_doubtful_without_signal = 0
 
     selected_refs = {str(b.get("Reference No.", "")).strip() for b in pipeline4_candidates}
 
@@ -177,17 +188,30 @@ def run() -> dict:
         reason = str(final_vote.get("reason", ""))
         has_inclusion, has_exclusion, inclusion_hits, exclusion_hits = _keyword_flags(bid)
 
-        # Exclusion is intentionally handled inside Pipeline 5.
+        # Hard reject rules (always applied before retention decisions).
         if has_exclusion:
-            category = "DOUBTFUL"
-            reason = f"{reason} | Exclusion keyword match forced DOUBTFUL.".strip(" |")
-        elif has_inclusion and category != "EXTRACTED":
+            rejected_by_exclusion += 1
+            ignored.append(bid)
+            continue
+        if confidence < FINAL_LOW_CONFIDENCE_REJECT:
+            rejected_by_low_confidence += 1
+            ignored.append(bid)
+            continue
+
+        # Retention logic after hard rejects.
+        if has_inclusion and category != "EXTRACTED":
             category = "EXTRACTED"
             reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
+        if category == "DOUBTFUL" and not has_inclusion and confidence < FINAL_HIGH_CONFIDENCE_OVERRIDE:
+            rejected_doubtful_without_signal += 1
+            ignored.append(bid)
+            continue
 
         if category not in {"EXTRACTED", "DOUBTFUL"}:
             category = "DOUBTFUL"
             reason = f"{reason} | Final class normalized to DOUBTFUL.".strip(" |")
+
+        reason = _build_reason(reason, inclusion_hits, exclusion_hits)
 
         bid["Final Category"] = category
         bid["LLM Confidence"] = confidence
@@ -227,6 +251,12 @@ def run() -> dict:
 
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
+    logger.info(
+        "Pipeline 5 rejects -> exclusion: %d, low_confidence: %d, doubtful_without_signal: %d",
+        rejected_by_exclusion,
+        rejected_by_low_confidence,
+        rejected_doubtful_without_signal,
+    )
     logger.info("Pipeline 5/5 complete -> extracted: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
@@ -242,5 +272,8 @@ def run() -> dict:
         "saved_doubtful": added_doubtful,
         "llm_final_coverage": round(final_coverage, 4),
         "llm_final_fallback_count": final_fallback_count,
+        "rejected_by_exclusion": rejected_by_exclusion,
+        "rejected_by_low_confidence": rejected_by_low_confidence,
+        "rejected_doubtful_without_signal": rejected_doubtful_without_signal,
         "supabase_sync": db_sync_ok,
     }
