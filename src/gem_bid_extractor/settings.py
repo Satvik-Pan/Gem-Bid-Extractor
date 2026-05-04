@@ -108,7 +108,7 @@ PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
 SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
 # Pipeline 5: if a bid matches exclusion keywords but not inclusion, reject when final LLM confidence is below this.
 EXCLUSION_REJECT_IF_CONFIDENCE_BELOW = float(
-    os.environ.get("EXCLUSION_REJECT_IF_CONFIDENCE_BELOW", "0.42")
+    os.environ.get("EXCLUSION_REJECT_IF_CONFIDENCE_BELOW", "0.4")
 )
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
