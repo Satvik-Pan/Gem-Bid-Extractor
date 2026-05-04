@@ -5,11 +5,11 @@ Cybersecurity bid extractor with a 5-stage pipeline, strict Anthropic classifica
 ## Architecture
 
 1. Pipeline 1: fetch GEM bids from the first 5 pages of `all-bids` with `Bid-Start-Date-Latest`, keep actionable `Bid No` entries, and exclude RA/non-actionable rows.
-2. Pipeline 1 enrichment: open each Bid No page with Selenium, resolve/download bid PDF, and extract full text.
+2. Pipeline 1 enrichment: Selenium opens the `all-bids` portal (sort aligned when the UI exposes it), then for each bid navigates to the Bid Doc URL (same as following the Bid No document link), syncs cookies into `requests`, downloads the PDF, and extracts full text (with a Selenium fallback on the bid list page if needed).
 3. Pipeline 2: independent LLM relevance pass over PDF-backed bid content.
 4. Pipeline 3: independent inclusion-keyword extraction over full PDF text.
-5. Pipeline 4: combine Pipeline 2 and Pipeline 3 outputs, then dedupe by reference.
-6. Pipeline 5: final LLM categorization into `EXTRACTED` and `DOUBTFUL`, then deterministic hard rejects (exclusion-hit or low-confidence) and strict doubtful retention.
+5. Pipeline 4: merge Pipeline 2 and Pipeline 3 only, then dedupe by reference (no extra filtering here).
+6. Pipeline 5: final LLM categorization into `EXTRACTED` and `DOUBTFUL`; inclusion keywords can promote to `EXTRACTED`, exclusion hits downgrade to `DOUBTFUL` for review (nothing is dropped at this stage).
 7. Append-only Excel writes for extracted and doubtful rows.
 8. Queue-first Supabase sync so DB failure does not stop extraction.
 9. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.

@@ -16,6 +16,7 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
 
 from .pdf_reader import extract_pdf_text
 from .settings import (
@@ -219,6 +220,39 @@ class GemScraper:
             return link
         return ""
 
+    def _sync_session_cookies_from_driver(self, driver: webdriver.Chrome) -> None:
+        """Copy browser cookies into the requests session (needed after Selenium hits GEM)."""
+        for c in driver.get_cookies():
+            name = c.get("name")
+            if not name:
+                continue
+            try:
+                self.session.cookies.set(
+                    name,
+                    c.get("value", ""),
+                    domain=c.get("domain"),
+                    path=c.get("path") or "/",
+                )
+            except Exception:
+                self.session.cookies.set(name, c.get("value", ""))
+
+    def _try_set_sort_bid_start_latest(self, driver: webdriver.Chrome) -> None:
+        """Best-effort: match portal sort to Bid Start Date latest (API already uses this)."""
+        try:
+            for sel_el in driver.find_elements(By.TAG_NAME, "select"):
+                try:
+                    sel = Select(sel_el)
+                except Exception:
+                    continue
+                for opt in sel.options:
+                    val = (opt.get_attribute("value") or "").strip()
+                    if val == SORT_ORDER or "Bid-Start-Date-Latest" in val:
+                        sel.select_by_value(val)
+                        time.sleep(0.4)
+                        return
+        except Exception as exc:
+            logger.debug("Could not set GEM sort control: %s", exc)
+
     def _download_pdf(self, pdf_url: str, bid_no: str) -> Path | None:
         if not pdf_url:
             return None
@@ -250,6 +284,15 @@ class GemScraper:
             return {"downloaded": 0, "failed": len(bids), "skipped": 0}
 
         try:
+            # Same-origin session as the portal: open all-bids, align sort, then reuse cookies per bid.
+            try:
+                driver.get(GEM_PAGE_URL)
+                time.sleep(1.2)
+                self._try_set_sort_bid_start_latest(driver)
+                self._sync_session_cookies_from_driver(driver)
+            except Exception as exc:
+                logger.warning("GEM portal warm-up failed (continuing): %s", exc)
+
             for bid in bids:
                 bid_no = str(bid.get("Bid No.", "")).strip()
                 bid_url = str(bid.get("Source URL", "")).strip()
@@ -260,16 +303,32 @@ class GemScraper:
                     bid["PDF Path"] = ""
                     continue
 
+                pdf_path: Path | None = None
+                pdf_text = ""
+
+                # Primary path: navigate to the Bid Doc URL in-browser (same as following the Bid No link), then download with session cookies.
                 if bid_doc_url:
-                    pdf_path = self._download_pdf(bid_doc_url, bid_no)
-                    if pdf_path:
-                        pdf_text = extract_pdf_text(pdf_path)
-                        if pdf_text:
-                            downloaded += 1
-                            bid["PDF Path"] = str(pdf_path)
-                            bid["PDF Text"] = pdf_text
-                            bid["Description"] = pdf_text[:1500]
-                            continue
+                    for attempt in range(PDF_FETCH_RETRIES + 2):
+                        try:
+                            driver.get(bid_doc_url)
+                            time.sleep(0.35 + 0.15 * attempt)
+                            self._sync_session_cookies_from_driver(driver)
+                            pdf_path = self._download_pdf(bid_doc_url, bid_no)
+                            if pdf_path and pdf_path.stat().st_size > 80:
+                                pdf_text = extract_pdf_text(pdf_path) or ""
+                                if pdf_text:
+                                    break
+                        except (TimeoutException, WebDriverException) as exc:
+                            logger.debug("Selenium bid doc attempt %s for %s: %s", attempt, bid_no, exc)
+                        pdf_path = None
+                        pdf_text = ""
+
+                if pdf_path and pdf_text:
+                    downloaded += 1
+                    bid["PDF Path"] = str(pdf_path)
+                    bid["PDF Text"] = pdf_text
+                    bid["Description"] = pdf_text[:1500]
+                    continue
 
                 pdf_link = ""
                 for _ in range(PDF_FETCH_RETRIES + 1):

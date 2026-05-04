@@ -6,20 +6,14 @@ import re
 from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
 from .gem_client import GemScraper
-from .settings import (
-    DOUBTFUL_FILE,
-    EXCLUSION_KEYWORDS,
-    EXCEL_FILE,
-    FINAL_DOUBTFUL_MIN_CONFIDENCE,
-    FINAL_LOW_CONFIDENCE_REJECT,
-    INCLUSION_KEYWORDS,
-)
+from .settings import DOUBTFUL_FILE, EXCLUSION_KEYWORDS, EXCEL_FILE, INCLUSION_KEYWORDS
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
 
 logger = logging.getLogger(__name__)
 _NON_WORD_BOUNDARY = r"[^a-z0-9]+"
 _WEAK_EXCLUSION_TERMS = {"next", "threat", "internet", "domain", "edge", "gateway"}
+_ILLEGAL_EXCEL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def _compile_keyword_pattern(term: str) -> re.Pattern[str]:
@@ -98,6 +92,18 @@ def _build_reason(base_reason: str, inclusion_hits: list[str], exclusion_hits: l
     return " | ".join(parts)[:500]
 
 
+def _sanitize_for_excel(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    return _ILLEGAL_EXCEL_CHARS.sub("", value)
+
+
+def _sanitize_bid_strings(bid: dict) -> dict:
+    for key, val in list(bid.items()):
+        bid[key] = _sanitize_for_excel(val)
+    return bid
+
+
 def run() -> dict:
     scraper = GemScraper()
     llm = AnthropicClaudeClassifier()
@@ -160,28 +166,26 @@ def run() -> dict:
             pipeline3_keyword.append(bid)
     logger.info("Pipeline 3/5 complete: %d selected bids", len(pipeline3_keyword))
 
-    # Pipeline 4: combine + dedupe pipeline2 and pipeline3 results.
+    # Pipeline 4: merge Pipeline 2 + Pipeline 3 and dedupe only (no exclusion or confidence filtering here).
     logger.info("Pipeline 4/5: Combining Pipeline 2 and Pipeline 3, then deduping")
     pipeline4_candidates = _merge_candidates(pipeline2_llm, pipeline3_keyword)
-    pipeline4_candidates = _dedupe_by_ref(pipeline4_candidates)
-    logger.info("Pipeline 4/5 complete: %d merged+deduped bids", len(pipeline4_candidates))
+    pipeline4_ready = _dedupe_by_ref(pipeline4_candidates)
+    logger.info("Pipeline 4/5 complete: %d merged+deduped bids", len(pipeline4_ready))
 
-    # Pipeline 5: final LLM categorization with in-stage exclusion handling.
+    # Pipeline 5: final LLM split into EXTRACTED vs DOUBTFUL; keep high recall (no silent drops).
     logger.info("Pipeline 5/5: Running final LLM categorization (EXTRACTED/DOUBTFUL)")
-    final_map = llm.final_classify(pipeline4_candidates) if pipeline4_candidates else {}
-    final_coverage = (len(final_map) / len(pipeline4_candidates)) if pipeline4_candidates else 1.0
+    final_map = llm.final_classify(pipeline4_ready) if pipeline4_ready else {}
+    final_coverage = (len(final_map) / len(pipeline4_ready)) if pipeline4_ready else 1.0
 
     relevant: list[dict] = []
     doubtful: list[dict] = []
     ignored: list[dict] = []
     final_fallback_count = 0
-    rejected_by_exclusion = 0
-    rejected_by_low_confidence = 0
-    rejected_doubtful_without_signal = 0
+    exclusion_downgrades = 0
 
-    selected_refs = {str(b.get("Reference No.", "")).strip() for b in pipeline4_candidates}
+    selected_refs = {str(b.get("Reference No.", "")).strip() for b in pipeline4_ready}
 
-    for bid in pipeline4_candidates:
+    for bid in pipeline4_ready:
         ref = str(bid.get("Reference No.", "")).strip()
         final_vote = final_map.get(ref)
         if final_vote is None:
@@ -198,23 +202,13 @@ def run() -> dict:
         reason = str(final_vote.get("reason", ""))
         has_inclusion, has_exclusion, inclusion_hits, exclusion_hits = _keyword_flags(bid)
 
-        # Hard reject rules (always applied before retention decisions).
-        if has_exclusion:
-            rejected_by_exclusion += 1
-            ignored.append(bid)
-            continue
-        # Retention logic after hard rejects.
         if has_inclusion and category != "EXTRACTED":
             category = "EXTRACTED"
             reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
-        if not has_inclusion and confidence < FINAL_LOW_CONFIDENCE_REJECT:
-            rejected_by_low_confidence += 1
-            ignored.append(bid)
-            continue
-        if category == "DOUBTFUL" and not has_inclusion and confidence < FINAL_DOUBTFUL_MIN_CONFIDENCE:
-            rejected_doubtful_without_signal += 1
-            ignored.append(bid)
-            continue
+        if has_exclusion:
+            exclusion_downgrades += 1
+            category = "DOUBTFUL"
+            reason = f"{reason} | Exclusion keyword hit; kept as DOUBTFUL for review (not dropped).".strip(" |")
 
         if category not in {"EXTRACTED", "DOUBTFUL"}:
             category = "DOUBTFUL"
@@ -231,9 +225,9 @@ def run() -> dict:
         bid["Exclusion Hits"] = ", ".join(exclusion_hits[:6])
 
         if category == "EXTRACTED":
-            relevant.append(bid)
+            relevant.append(_sanitize_bid_strings(bid))
         else:
-            doubtful.append(bid)
+            doubtful.append(_sanitize_bid_strings(bid))
 
     # Mark non-selected Pipeline1 bids as ignored to avoid infinite reprocessing.
     for bid in pipeline1_new:
@@ -260,12 +254,7 @@ def run() -> dict:
 
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
-    logger.info(
-        "Pipeline 5 rejects -> exclusion: %d, low_confidence: %d, doubtful_without_signal: %d",
-        rejected_by_exclusion,
-        rejected_by_low_confidence,
-        rejected_doubtful_without_signal,
-    )
+    logger.info("Pipeline 5 notes -> exclusion_downgrades_to_doubtful: %d", exclusion_downgrades)
     logger.info("Pipeline 5/5 complete -> extracted: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
@@ -279,14 +268,13 @@ def run() -> dict:
         "pipeline2_count": len(pipeline2_llm),
         "pipeline3_count": len(pipeline3_keyword),
         "pipeline4_merged": len(pipeline4_candidates),
+        "pipeline4_ready": len(pipeline4_ready),
         "relevant": len(relevant),
         "doubtful": len(doubtful),
         "saved_main": added_main,
         "saved_doubtful": added_doubtful,
         "llm_final_coverage": round(final_coverage, 4),
         "llm_final_fallback_count": final_fallback_count,
-        "rejected_by_exclusion": rejected_by_exclusion,
-        "rejected_by_low_confidence": rejected_by_low_confidence,
-        "rejected_doubtful_without_signal": rejected_doubtful_without_signal,
+        "exclusion_downgrades_to_doubtful": exclusion_downgrades,
         "supabase_sync": db_sync_ok,
     }

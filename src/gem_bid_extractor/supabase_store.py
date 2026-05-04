@@ -94,6 +94,23 @@ class SupabaseStore:
         self._save_queue(merged)
         return len(merged)
 
+    def clear_worklist(self) -> bool:
+        """Delete all rows from bid_worklist (dashboard). Returns True if DB was cleared or sync disabled."""
+        if not self.enabled:
+            return True
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("delete from bid_worklist")
+                conn.commit()
+            self.last_error = ""
+            logger.info("Supabase bid_worklist cleared")
+            return True
+        except psycopg2.Error as exc:
+            self.last_error = str(exc)
+            logger.warning("Could not truncate bid_worklist: %s", exc)
+            return False
+
     def ensure_schema(self) -> None:
         if not self.enabled:
             return

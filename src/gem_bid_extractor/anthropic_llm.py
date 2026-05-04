@@ -35,8 +35,9 @@ Return strict JSON only:
 {"results":[{"ref":"<Reference No.>","category":"EXTRACTED"|"DOUBTFUL","confidence":0.0,"reason":"short reason"}]}
 
 Rules:
-- EXTRACTED: strong cybersecurity relevance.
-- DOUBTFUL: partial/ambiguous relevance, needs review.
+- Prefer recall: if the bid could plausibly matter for cybersecurity procurement, lean EXTRACTED or DOUBTFUL rather than hiding it.
+- EXTRACTED: clear or strong cybersecurity relevance from the supplied text.
+- DOUBTFUL: weak signal, noisy text, or ambiguous relevance — still keep in DOUBTFUL (do not imply the bid should be discarded).
 - Return exactly one result per input ref.
 """
 
@@ -90,21 +91,24 @@ class AnthropicClaudeClassifier:
                 return requests.post(url, headers=headers, json=payload, timeout=timeout)
 
     @staticmethod
-    def _bid_summary(bid: dict) -> str:
-        desc = str(bid.get("Description", ""))
-        if len(desc) > 140:
-            desc = desc[:140]
-        pdf_text = str(bid.get("PDF Text", ""))
-        if len(pdf_text) > 1800:
-            pdf_text = pdf_text[:1800]
+    def _safe_snippet(text: object, max_len: int) -> str:
+        s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", str(text or "")).strip()
+        if len(s) <= max_len:
+            return s
+        return s[: max_len - 3] + "..."
+
+    @classmethod
+    def _bid_summary(cls, bid: dict, *, pdf_max: int = 1800, desc_max: int = 140) -> str:
+        desc = cls._safe_snippet(bid.get("Description", ""), desc_max)
+        pdf_text = cls._safe_snippet(bid.get("PDF Text", ""), pdf_max)
         return (
-            f"Ref: {bid.get('Reference No.', '')}\n"
-            f"Bid No: {bid.get('Bid No.', '')}\n"
-            f"RA No: {bid.get('RA No.', '')}\n"
-            f"Category: {bid.get('Category', '')}\n"
-            f"Title: {bid.get('Name', '')}\n"
+            f"Ref: {cls._safe_snippet(bid.get('Reference No.', ''), 120)}\n"
+            f"Bid No: {cls._safe_snippet(bid.get('Bid No.', ''), 80)}\n"
+            f"RA No: {cls._safe_snippet(bid.get('RA No.', ''), 80)}\n"
+            f"Category: {cls._safe_snippet(bid.get('Category', ''), 200)}\n"
+            f"Title: {cls._safe_snippet(bid.get('Name', ''), 500)}\n"
             f"Description: {desc}\n"
-            f"Department: {bid.get('Department', '')}\n"
+            f"Department: {cls._safe_snippet(bid.get('Department', ''), 300)}\n"
             f"PDF Extract: {pdf_text}"
         )
 
@@ -139,13 +143,23 @@ class AnthropicClaudeClassifier:
                     parts.append(txt)
         return "".join(parts)
 
-    def _call_messages_api(self, bids: list[dict], system_prompt: str, max_tokens: int = 900) -> dict[str, dict]:
+    def _call_messages_api(
+        self,
+        bids: list[dict],
+        system_prompt: str,
+        max_tokens: int = 900,
+        *,
+        pdf_max: int = 1800,
+        desc_max: int = 140,
+    ) -> dict[str, dict]:
         if not self.enabled:
             raise RuntimeError("Anthropic classifier is not configured. Set ANTHROPIC_API_KEY, ANTHROPIC_MODEL, and ANTHROPIC_BASE_URL.")
         if not bids:
             return {}
 
-        user_content = "\n\n".join(self._bid_summary(b) for b in bids)
+        user_content = "\n\n".join(self._bid_summary(b, pdf_max=pdf_max, desc_max=desc_max) for b in bids)
+        if len(user_content) > 180_000:
+            user_content = user_content[:180_000] + "\n\n[truncated]"
         payload = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -187,6 +201,12 @@ class AnthropicClaudeClassifier:
                     logger.warning("Anthropic DNS resolution failure on attempt %d/10; waiting %ss", attempt, wait_s)
                     time.sleep(wait_s)
                     continue
+                if status == 400 and isinstance(exc, requests.HTTPError) and exc.response is not None:
+                    try:
+                        detail = exc.response.text[:800]
+                    except Exception:
+                        detail = ""
+                    logger.warning("Anthropic HTTP 400 body (truncated): %s", detail)
                 if status and status >= 500 and attempt < 10:
                     wait_s = min(45, attempt * 4)
                     logger.warning("Anthropic HTTP %s on attempt %d/10; waiting %ss", status, attempt, wait_s)
@@ -216,7 +236,7 @@ class AnthropicClaudeClassifier:
                 break
             payload_bids = list(pending_map.values())
             max_tokens = min(2500, max(700, len(payload_bids) * 40))
-            data = self._call_messages_api(payload_bids, _PREFILTER_PROMPT, max_tokens=max_tokens)
+            data = self._call_messages_api(payload_bids, _PREFILTER_PROMPT, max_tokens=max_tokens, pdf_max=1800, desc_max=140)
             for item in data.get("results", []):
                 ref = item.get("ref", "")
                 decision = str(item.get("decision", "")).upper()
@@ -248,7 +268,13 @@ class AnthropicClaudeClassifier:
                 break
             payload_bids = list(pending_map.values())
             max_tokens = min(5000, max(1400, len(payload_bids) * 140))
-            data = self._call_messages_api(payload_bids, _FINAL_CLASS_PROMPT, max_tokens=max_tokens)
+            data = self._call_messages_api(
+                payload_bids,
+                _FINAL_CLASS_PROMPT,
+                max_tokens=max_tokens,
+                pdf_max=900,
+                desc_max=100,
+            )
             for item in data.get("results", []):
                 ref = item.get("ref", "")
                 category = str(item.get("category", "")).upper()
@@ -283,7 +309,7 @@ class AnthropicClaudeClassifier:
 
         results: dict[str, dict] = {}
         total = len(bids)
-        batch_size = LLM_BATCH_SIZE if mode == "prefilter" else max(10, LLM_BATCH_SIZE // 3)
+        batch_size = LLM_BATCH_SIZE if mode == "prefilter" else max(4, min(8, LLM_BATCH_SIZE // 5))
         total_batches = (total + batch_size - 1) // batch_size if total else 0
 
         for i in range(0, total, batch_size):

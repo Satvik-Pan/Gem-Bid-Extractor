@@ -106,8 +106,6 @@ SESSION_REFRESH_EVERY = 100
 PDF_FETCH_TIMEOUT_SECONDS = int(os.environ.get("PDF_FETCH_TIMEOUT_SECONDS", "25"))
 PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
 SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
-FINAL_LOW_CONFIDENCE_REJECT = float(os.environ.get("FINAL_LOW_CONFIDENCE_REJECT", "0.12"))
-FINAL_DOUBTFUL_MIN_CONFIDENCE = float(os.environ.get("FINAL_DOUBTFUL_MIN_CONFIDENCE", "0.4"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
