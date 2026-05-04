@@ -82,9 +82,19 @@ def _load_keyword_sets() -> tuple[list[str], list[str]]:
     except OSError:
         return DEFAULT_INCLUSION_KEYWORDS, DEFAULT_EXCLUSION_KEYWORDS
 
-    inclusion = inclusion or DEFAULT_INCLUSION_KEYWORDS
+    inclusion = inclusion or list(DEFAULT_INCLUSION_KEYWORDS)
     exclusion = exclusion or DEFAULT_EXCLUSION_KEYWORDS
-    return sorted(set(inclusion)), sorted(set(exclusion))
+    # Preserve CSV order for inclusion (exactly the 11 product terms); dedupe only.
+    inc_seen: set[str] = set()
+    inclusion_ordered: list[str] = []
+    for t in inclusion:
+        k = t.lower()
+        if k in inc_seen:
+            continue
+        inc_seen.add(k)
+        inclusion_ordered.append(t)
+    inclusion = inclusion_ordered or list(DEFAULT_INCLUSION_KEYWORDS)
+    return inclusion, sorted(set(exclusion))
 
 
 INCLUSION_KEYWORDS, EXCLUSION_KEYWORDS = _load_keyword_sets()
@@ -109,6 +119,14 @@ SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not
 # Pipeline 5: if a bid matches exclusion keywords but not inclusion, reject when final LLM confidence is below this.
 EXCLUSION_REJECT_IF_CONFIDENCE_BELOW = float(
     os.environ.get("EXCLUSION_REJECT_IF_CONFIDENCE_BELOW", "0.4")
+)
+# Pipeline 5: DOUBTFUL + no inclusion keyword + final LLM confidence below this → reject (not on portal).
+FINAL_DOUBTFUL_REJECT_IF_NO_INCLUSION_BELOW = float(
+    os.environ.get("FINAL_DOUBTFUL_REJECT_IF_NO_INCLUSION_BELOW", "0.22")
+)
+# If final LLM says EXTRACTED with at least this confidence, keep EXTRACTED even when exclusion keywords hit.
+LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN = float(
+    os.environ.get("LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN", "0.72")
 )
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")

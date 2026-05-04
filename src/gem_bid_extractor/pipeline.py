@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 
 from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
@@ -11,7 +12,9 @@ from .settings import (
     EXCLUSION_KEYWORDS,
     EXCLUSION_REJECT_IF_CONFIDENCE_BELOW,
     EXCEL_FILE,
+    FINAL_DOUBTFUL_REJECT_IF_NO_INCLUSION_BELOW,
     INCLUSION_KEYWORDS,
+    LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN,
 )
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
@@ -78,6 +81,22 @@ _INCLUSION_PATTERN_SET = _compile_keyword_sets(INCLUSION_KEYWORDS)
 _EXCLUSION_PATTERN_SET = _compile_keyword_sets(EXCLUSION_KEYWORDS)
 
 
+def _refresh_keyword_patterns() -> None:
+    """Recompile from settings so CSV/inclusion list edits apply on each run."""
+    global _INCLUSION_PATTERN_SET, _EXCLUSION_PATTERN_SET
+    from .settings import EXCLUSION_KEYWORDS as _exc
+    from .settings import INCLUSION_KEYWORDS as _inc
+
+    _INCLUSION_PATTERN_SET = _compile_keyword_sets(list(_inc))
+    _EXCLUSION_PATTERN_SET = _compile_keyword_sets(list(_exc))
+
+
+def _unicode_normalize_text(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.replace("\u00ad", "").replace("\u200b", "").replace("\u200c", "")
+
+
 def _build_keyword_haystack(bid: dict) -> str:
     parts = [
         str(bid.get("Name", "")),
@@ -87,7 +106,8 @@ def _build_keyword_haystack(bid: dict) -> str:
         str(bid.get("PDF Text", "")),
     ]
     raw = " | ".join(parts)
-    s = raw.lower()
+    s = _unicode_normalize_text(raw)
+    s = s.casefold()
     s = re.sub(r"[\u200b\xa0]+", " ", s)
     s = re.sub(r"[\s\r\n\t]+", " ", s)
     s = re.sub(r"[_/\\|:;,.]+", " ", s)
@@ -105,8 +125,17 @@ def _match_keyword_set(pattern_set: list[tuple[str, list[re.Pattern[str]]]], hay
 
 
 def _alnum_glue(haystack: str) -> str:
-    """Letters/digits only, lowercased — catches PDF lines with no spaces (e.g. ...NGFW...firewall...)."""
-    return "".join(ch.lower() for ch in haystack if ch.isalnum())
+    """Letters/digits only (Unicode-aware) — glued runs without spaces."""
+    return "".join(ch for ch in haystack.casefold() if ch.isalnum())
+
+
+def _latin_ascii_glue(haystack: str) -> str:
+    """
+    a-z and 0-9 only after casefold — helps when PDF mixes English with other scripts
+    so inclusion terms like 'ngfw' still match the Latin stream.
+    """
+    s = haystack.casefold()
+    return "".join(c for c in s if ("a" <= c <= "z") or c.isdigit())
 
 
 def _glued_substring_hits(
@@ -167,11 +196,30 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
 
 def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
     haystack = _build_keyword_haystack(bid)
-    glue = _alnum_glue(haystack)
+    glue_u = _alnum_glue(haystack)
+    glue_a = _latin_ascii_glue(haystack)
     inclusion_hits = _match_keyword_set(_INCLUSION_PATTERN_SET, haystack)
-    inclusion_hits.extend(_glued_substring_hits(_INCLUSION_PATTERN_SET, glue, inclusion_hits))
+    for glue in (glue_u, glue_a):
+        if glue:
+            inclusion_hits.extend(_glued_substring_hits(_INCLUSION_PATTERN_SET, glue, inclusion_hits))
     exclusion_hits = _match_keyword_set(_EXCLUSION_PATTERN_SET, haystack)
-    exclusion_hits.extend(_glued_substring_hits(_EXCLUSION_PATTERN_SET, glue, exclusion_hits))
+    for glue in (glue_u, glue_a):
+        if glue:
+            exclusion_hits.extend(_glued_substring_hits(_EXCLUSION_PATTERN_SET, glue, exclusion_hits))
+    # Dedupe while keeping order
+    def _dedupe_labels(xs: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for x in xs:
+            k = x.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(x)
+        return out
+
+    inclusion_hits = _dedupe_labels(inclusion_hits)
+    exclusion_hits = _dedupe_labels(exclusion_hits)
     has_inclusion = bool(inclusion_hits)
     has_exclusion = bool(exclusion_hits)
     return has_inclusion, has_exclusion, inclusion_hits, exclusion_hits
@@ -201,6 +249,8 @@ def _sanitize_bid_strings(bid: dict) -> dict:
 
 
 def run() -> dict:
+    _refresh_keyword_patterns()
+
     scraper = GemScraper()
     llm = AnthropicClaudeClassifier()
     tracker = BidTracker()
@@ -244,9 +294,9 @@ def run() -> dict:
         ref = str(bid.get("Reference No.", "")).strip()
         decision = relevance_map.get(ref)
         if decision is None:
-            decision = {"decision": "YES", "confidence": 0.5}
-            logger.warning("Pipeline2 missing LLM decision for %s; defaulting to YES", ref)
-        keep = decision.get("decision") == "YES" or float(decision.get("confidence", 0.0)) >= 0.4
+            decision = {"decision": "NO", "confidence": 0.15}
+            logger.warning("Pipeline2 missing LLM decision for %s; defaulting to NO", ref)
+        keep = decision.get("decision") == "YES"
         if keep:
             bid["Pipeline2 LLM Confidence"] = round(float(decision.get("confidence", 0.0)), 3)
             pipeline2_llm.append(bid)
@@ -287,6 +337,7 @@ def run() -> dict:
     final_fallback_count = 0
     exclusion_to_doubtful = 0
     exclusion_rejected_low_confidence = 0
+    rejected_weak_doubtful = 0
 
     selected_refs = {str(b.get("Reference No.", "")).strip() for b in pipeline4_ready}
 
@@ -317,20 +368,32 @@ def run() -> dict:
             else:
                 reason = f"{reason} | Inclusion keyword match → EXTRACTED.".strip(" |")
         elif has_exclusion:
-            if confidence < EXCLUSION_REJECT_IF_CONFIDENCE_BELOW:
+            # Strong cyber signal: keep EXTRACTED (e.g. DSC hit by generic "authentication" exclusion).
+            if category == "EXTRACTED" and confidence >= LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN:
+                reason = (
+                    f"{reason} | Exclusion keyword(s) present but final model confidence "
+                    f"{confidence:.2f} ≥ {LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN:.2f} → kept as EXTRACTED."
+                ).strip(" |")
+            elif confidence < EXCLUSION_REJECT_IF_CONFIDENCE_BELOW:
                 exclusion_rejected_low_confidence += 1
                 ignored.append(bid)
                 continue
-            exclusion_to_doubtful += 1
-            category = "DOUBTFUL"
-            reason = (
-                f"{reason} | Exclusion keyword(s) with model confidence "
-                f"{confidence:.2f} ≥ {EXCLUSION_REJECT_IF_CONFIDENCE_BELOW:.2f} → DOUBTFUL for review."
-            ).strip(" |")
+            else:
+                exclusion_to_doubtful += 1
+                category = "DOUBTFUL"
+                reason = (
+                    f"{reason} | Exclusion keyword(s) with model confidence "
+                    f"{confidence:.2f} ≥ {EXCLUSION_REJECT_IF_CONFIDENCE_BELOW:.2f} → DOUBTFUL for review."
+                ).strip(" |")
         else:
             if category not in {"EXTRACTED", "DOUBTFUL"}:
                 category = "DOUBTFUL"
                 reason = f"{reason} | Final class normalized to DOUBTFUL.".strip(" |")
+
+        if category == "DOUBTFUL" and not has_inclusion and confidence < FINAL_DOUBTFUL_REJECT_IF_NO_INCLUSION_BELOW:
+            rejected_weak_doubtful += 1
+            ignored.append(bid)
+            continue
 
         reason = _build_reason(reason, inclusion_hits, exclusion_hits)
 
@@ -373,9 +436,11 @@ def run() -> dict:
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
     logger.info(
-        "Pipeline 5 notes -> exclusion_to_doubtful: %d, exclusion_rejected_low_confidence: %d",
+        "Pipeline 5 notes -> exclusion_to_doubtful: %d, exclusion_rejected_low_confidence: %d, "
+        "rejected_weak_doubtful_no_inclusion: %d",
         exclusion_to_doubtful,
         exclusion_rejected_low_confidence,
+        rejected_weak_doubtful,
     )
     logger.info("Pipeline 5/5 complete -> extracted: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
@@ -399,5 +464,6 @@ def run() -> dict:
         "llm_final_fallback_count": final_fallback_count,
         "exclusion_to_doubtful": exclusion_to_doubtful,
         "exclusion_rejected_low_confidence": exclusion_rejected_low_confidence,
+        "rejected_weak_doubtful_no_inclusion": rejected_weak_doubtful,
         "supabase_sync": db_sync_ok,
     }

@@ -19,25 +19,25 @@ from .settings import (
     LLM_BATCH_SIZE,
 )
 
-_PREFILTER_PROMPT = """You are doing broad cybersecurity pre-filtering for Indian government bids.
+_PREFILTER_PROMPT = """You are doing cybersecurity pre-filtering for Indian government bids (network security, firewalls, VPN, SOC, PKI, etc.).
 Return strict JSON only:
 {"results":[{"ref":"<Reference No.>","decision":"YES"|"NO","confidence":0.0}]}
 
 Rules:
-- YES for clearly cybersecurity-related or potentially cybersecurity-related bids.
-- Be recall-oriented: if uncertain but possible cybersecurity, prefer YES with medium confidence.
-- NO only when clearly non-cyber domain.
+- YES only when the bid plausibly involves cybersecurity products, services, or security-relevant IT (e.g. firewalls, NGFW, VPN, IAM/PKI, security audit, SOC, encryption hardware tied to security).
+- NO for clearly unrelated physical goods and services: cables, wires, vehicles, janitorial/cleaning, food/ration, fire extinguishers (unless explicitly tied to network security systems), explosives for civil works, generic office paper/consumables, medical/ambulance, pumps, mechanical parts, industrial commodities, unless the text clearly ties them to cybersecurity scope.
+- If uncertain but a reasonable cyber angle exists, YES with moderate confidence; if the text is generic procurement with no security angle, NO with low confidence.
 - Return exactly one result per input ref.
 """
 
-_FINAL_CLASS_PROMPT = """You are the final classifier for Indian government bids.
+_FINAL_CLASS_PROMPT = """You are the final classifier for Indian government bids (cybersecurity relevance only).
 Return strict JSON only:
 {"results":[{"ref":"<Reference No.>","category":"EXTRACTED"|"DOUBTFUL","confidence":0.0,"reason":"short reason"}]}
 
 Rules:
-- Prefer recall: if the bid could plausibly matter for cybersecurity procurement, lean EXTRACTED or DOUBTFUL rather than hiding it.
-- EXTRACTED: clear or strong cybersecurity relevance from the supplied text.
-- DOUBTFUL: weak signal, noisy text, or ambiguous relevance — still keep in DOUBTFUL (do not imply the bid should be discarded).
+- EXTRACTED: clear or strong cybersecurity relevance (network security, firewalls, VPN, PKI/dsc, SOC, security appliances, etc.).
+- DOUBTFUL: some possible but weak/ambiguous security angle; use a **low confidence (e.g. under 0.2)** when the bid is almost certainly not cybersecurity (office supplies, vehicles, cables, cleaning, food, generic mechanical goods) so downstream rules can drop it.
+- Do **not** label unrelated physical/consumables as EXTRACTED. For clearly non-cyber bids, use DOUBTFUL with **very low confidence** (under 0.15) and a short reason.
 - Return exactly one result per input ref.
 """
 
