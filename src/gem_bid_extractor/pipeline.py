@@ -104,6 +104,31 @@ def _match_keyword_set(pattern_set: list[tuple[str, list[re.Pattern[str]]]], hay
     return hits
 
 
+def _alnum_glue(haystack: str) -> str:
+    """Letters/digits only, lowercased — catches PDF lines with no spaces (e.g. ...NGFW...firewall...)."""
+    return "".join(ch.lower() for ch in haystack if ch.isalnum())
+
+
+def _glued_substring_hits(
+    pattern_set: list[tuple[str, list[re.Pattern[str]]]], glue: str, already: list[str]
+) -> list[str]:
+    seen = set(already)
+    extra: list[str] = []
+    for label, _ in pattern_set:
+        if label in seen:
+            continue
+        parts = _tokenize_keyword_phrase(label)
+        if not parts:
+            continue
+        compact = "".join(parts)
+        if len(compact) < 3:
+            continue
+        if compact in glue:
+            extra.append(label)
+            seen.add(label)
+    return extra
+
+
 def _dedupe_by_ref(bids: list[dict]) -> list[dict]:
     seen: set[str] = set()
     out: list[dict] = []
@@ -142,8 +167,11 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
 
 def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
     haystack = _build_keyword_haystack(bid)
+    glue = _alnum_glue(haystack)
     inclusion_hits = _match_keyword_set(_INCLUSION_PATTERN_SET, haystack)
+    inclusion_hits.extend(_glued_substring_hits(_INCLUSION_PATTERN_SET, glue, inclusion_hits))
     exclusion_hits = _match_keyword_set(_EXCLUSION_PATTERN_SET, haystack)
+    exclusion_hits.extend(_glued_substring_hits(_EXCLUSION_PATTERN_SET, glue, exclusion_hits))
     has_inclusion = bool(inclusion_hits)
     has_exclusion = bool(exclusion_hits)
     return has_inclusion, has_exclusion, inclusion_hits, exclusion_hits
