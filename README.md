@@ -55,6 +55,12 @@ Cybersecurity bid extractor with a 5-stage pipeline, strict Anthropic classifica
 python main.py
 ```
 
+To wipe local state (processed bids, PDF cache, Excel outputs, sync queue) and clear the Supabase `bid_worklist` before a fresh run:
+
+```powershell
+python main.py --full-reset
+```
+
 or on Windows:
 
 ```powershell
