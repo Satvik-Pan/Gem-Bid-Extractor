@@ -6,26 +6,102 @@ import re
 from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
 from .gem_client import GemScraper
-from .settings import DOUBTFUL_FILE, EXCLUSION_KEYWORDS, EXCEL_FILE, INCLUSION_KEYWORDS
+from .settings import (
+    DOUBTFUL_FILE,
+    EXCLUSION_KEYWORDS,
+    EXCLUSION_REJECT_IF_CONFIDENCE_BELOW,
+    EXCEL_FILE,
+    INCLUSION_KEYWORDS,
+)
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
 
 logger = logging.getLogger(__name__)
-_NON_WORD_BOUNDARY = r"[^a-z0-9]+"
-_WEAK_EXCLUSION_TERMS = {"next", "threat", "internet", "domain", "edge", "gateway"}
 _ILLEGAL_EXCEL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
-def _compile_keyword_pattern(term: str) -> re.Pattern[str]:
-    chunks = [re.escape(chunk) for chunk in re.split(_NON_WORD_BOUNDARY, term.lower()) if chunk]
-    if not chunks:
+def _tokenize_keyword_phrase(term: str) -> list[str]:
+    return [p for p in re.split(r"[^a-z0-9]+", term.strip().lower()) if p]
+
+
+def _single_token_pattern(token: str) -> re.Pattern[str]:
+    """Match a token as a whole word (handles ASCII alnum boundaries; PDF noise tolerant)."""
+    t = re.escape(token)
+    return re.compile(rf"(?<![a-z0-9]){t}(?![a-z0-9])", re.IGNORECASE)
+
+
+def _flexible_phrase_pattern(term: str) -> re.Pattern[str]:
+    """
+    Match multi-word phrases when words are separated by spaces, hyphens, slashes, commas, etc.
+    Avoids the old \\b...\\s+...\\b rule that missed 'next-generation-firewall' and 'firewall' vs 'fire wall'.
+    """
+    parts = _tokenize_keyword_phrase(term)
+    if not parts:
         return re.compile(r"$^")
-    pattern = r"\b" + r"\s+".join(chunks) + r"\b"
-    return re.compile(pattern, re.IGNORECASE)
+    if len(parts) == 1:
+        return _single_token_pattern(parts[0])
+    sep = r"[^\w]+"  # any run of non-word chars between word tokens
+    body = sep.join(re.escape(p) for p in parts)
+    return re.compile(rf"(?<![a-z0-9]){body}(?![a-z0-9])", re.IGNORECASE)
 
 
-_INCLUSION_PATTERNS = [(term, _compile_keyword_pattern(term)) for term in INCLUSION_KEYWORDS]
-_EXCLUSION_PATTERNS = [(term, _compile_keyword_pattern(term)) for term in EXCLUSION_KEYWORDS]
+def _patterns_for_keyword_term(term: str) -> list[re.Pattern[str]]:
+    """One or more regexes per keyword (e.g. 'fire wall' also tries 'firewall')."""
+    tnorm = " ".join(term.strip().lower().split())
+    if not tnorm:
+        return [re.compile(r"$^")]
+    pats: list[re.Pattern[str]] = [_flexible_phrase_pattern(tnorm)]
+    parts = _tokenize_keyword_phrase(tnorm)
+    if len(parts) == 2:
+        joined = "".join(parts)
+        if len(joined) <= 32:
+            pats.append(_single_token_pattern(joined))
+    return pats
+
+
+def _compile_keyword_sets(terms: list[str]) -> list[tuple[str, list[re.Pattern[str]]]]:
+    seen: set[str] = set()
+    out: list[tuple[str, list[re.Pattern[str]]]] = []
+    for raw in terms:
+        label = " ".join(raw.strip().split())
+        if not label:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((label, _patterns_for_keyword_term(label)))
+    return out
+
+
+_INCLUSION_PATTERN_SET = _compile_keyword_sets(INCLUSION_KEYWORDS)
+_EXCLUSION_PATTERN_SET = _compile_keyword_sets(EXCLUSION_KEYWORDS)
+
+
+def _build_keyword_haystack(bid: dict) -> str:
+    parts = [
+        str(bid.get("Name", "")),
+        str(bid.get("Description", "")),
+        str(bid.get("Category", "")),
+        str(bid.get("Department", "")),
+        str(bid.get("PDF Text", "")),
+    ]
+    raw = " | ".join(parts)
+    s = raw.lower()
+    s = re.sub(r"[\u200b\xa0]+", " ", s)
+    s = re.sub(r"[\s\r\n\t]+", " ", s)
+    s = re.sub(r"[_/\\|:;,.]+", " ", s)
+    s = re.sub(r"-+", " ", s)
+    s = re.sub(r" +", " ", s).strip()
+    return f" {s} "
+
+
+def _match_keyword_set(pattern_set: list[tuple[str, list[re.Pattern[str]]]], haystack: str) -> list[str]:
+    hits: list[str] = []
+    for label, pats in pattern_set:
+        if any(p.search(haystack) for p in pats):
+            hits.append(label)
+    return hits
 
 
 def _dedupe_by_ref(bids: list[dict]) -> list[dict]:
@@ -65,19 +141,11 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
 
 
 def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
-    text_parts = [
-        str(bid.get("Name", "")),
-        str(bid.get("Description", "")),
-        str(bid.get("Category", "")),
-        str(bid.get("PDF Text", "")),
-    ]
-    haystack = " ".join(text_parts).lower().strip()
-    inclusion_hits = [term for term, pattern in _INCLUSION_PATTERNS if pattern.search(haystack)]
-    exclusion_hits = [term for term, pattern in _EXCLUSION_PATTERNS if pattern.search(haystack)]
-    strong_exclusion_hits = [term for term in exclusion_hits if term not in _WEAK_EXCLUSION_TERMS]
-    weak_exclusion_hits = [term for term in exclusion_hits if term in _WEAK_EXCLUSION_TERMS]
+    haystack = _build_keyword_haystack(bid)
+    inclusion_hits = _match_keyword_set(_INCLUSION_PATTERN_SET, haystack)
+    exclusion_hits = _match_keyword_set(_EXCLUSION_PATTERN_SET, haystack)
     has_inclusion = bool(inclusion_hits)
-    has_exclusion = bool(strong_exclusion_hits) or len(weak_exclusion_hits) >= 2
+    has_exclusion = bool(exclusion_hits)
     return has_inclusion, has_exclusion, inclusion_hits, exclusion_hits
 
 
@@ -165,6 +233,14 @@ def run() -> dict:
             bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
             pipeline3_keyword.append(bid)
     logger.info("Pipeline 3/5 complete: %d selected bids", len(pipeline3_keyword))
+    if not pipeline3_keyword and pipeline1_pdf_ready:
+        sample = pipeline1_pdf_ready[0]
+        plen = len(str(sample.get("PDF Text", "")))
+        logger.warning(
+            "Pipeline 3 matched 0 bids; check PDF text (sample ref %s PDF chars=%d).",
+            str(sample.get("Reference No.", ""))[:40],
+            plen,
+        )
 
     # Pipeline 4: merge Pipeline 2 + Pipeline 3 and dedupe only (no exclusion or confidence filtering here).
     logger.info("Pipeline 4/5: Combining Pipeline 2 and Pipeline 3, then deduping")
@@ -172,7 +248,7 @@ def run() -> dict:
     pipeline4_ready = _dedupe_by_ref(pipeline4_candidates)
     logger.info("Pipeline 4/5 complete: %d merged+deduped bids", len(pipeline4_ready))
 
-    # Pipeline 5: final LLM split into EXTRACTED vs DOUBTFUL; keep high recall (no silent drops).
+    # Pipeline 5: LLM split + inclusion forces EXTRACTED; exclusion without inclusion → doubtful or reject.
     logger.info("Pipeline 5/5: Running final LLM categorization (EXTRACTED/DOUBTFUL)")
     final_map = llm.final_classify(pipeline4_ready) if pipeline4_ready else {}
     final_coverage = (len(final_map) / len(pipeline4_ready)) if pipeline4_ready else 1.0
@@ -181,7 +257,8 @@ def run() -> dict:
     doubtful: list[dict] = []
     ignored: list[dict] = []
     final_fallback_count = 0
-    exclusion_downgrades = 0
+    exclusion_to_doubtful = 0
+    exclusion_rejected_low_confidence = 0
 
     selected_refs = {str(b.get("Reference No.", "")).strip() for b in pipeline4_ready}
 
@@ -202,17 +279,30 @@ def run() -> dict:
         reason = str(final_vote.get("reason", ""))
         has_inclusion, has_exclusion, inclusion_hits, exclusion_hits = _keyword_flags(bid)
 
-        if has_inclusion and category != "EXTRACTED":
+        if has_inclusion:
             category = "EXTRACTED"
-            reason = f"{reason} | Inclusion keyword detected; promoted to EXTRACTED.".strip(" |")
-        if has_exclusion:
-            exclusion_downgrades += 1
+            if has_exclusion:
+                reason = (
+                    f"{reason} | Inclusion keyword match → EXTRACTED (dashboard); "
+                    f"exclusion terms also present — review notes in Exclusion Hits."
+                ).strip(" |")
+            else:
+                reason = f"{reason} | Inclusion keyword match → EXTRACTED.".strip(" |")
+        elif has_exclusion:
+            if confidence < EXCLUSION_REJECT_IF_CONFIDENCE_BELOW:
+                exclusion_rejected_low_confidence += 1
+                ignored.append(bid)
+                continue
+            exclusion_to_doubtful += 1
             category = "DOUBTFUL"
-            reason = f"{reason} | Exclusion keyword hit; kept as DOUBTFUL for review (not dropped).".strip(" |")
-
-        if category not in {"EXTRACTED", "DOUBTFUL"}:
-            category = "DOUBTFUL"
-            reason = f"{reason} | Final class normalized to DOUBTFUL.".strip(" |")
+            reason = (
+                f"{reason} | Exclusion keyword(s) with model confidence "
+                f"{confidence:.2f} ≥ {EXCLUSION_REJECT_IF_CONFIDENCE_BELOW:.2f} → DOUBTFUL for review."
+            ).strip(" |")
+        else:
+            if category not in {"EXTRACTED", "DOUBTFUL"}:
+                category = "DOUBTFUL"
+                reason = f"{reason} | Final class normalized to DOUBTFUL.".strip(" |")
 
         reason = _build_reason(reason, inclusion_hits, exclusion_hits)
 
@@ -254,7 +344,11 @@ def run() -> dict:
 
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
-    logger.info("Pipeline 5 notes -> exclusion_downgrades_to_doubtful: %d", exclusion_downgrades)
+    logger.info(
+        "Pipeline 5 notes -> exclusion_to_doubtful: %d, exclusion_rejected_low_confidence: %d",
+        exclusion_to_doubtful,
+        exclusion_rejected_low_confidence,
+    )
     logger.info("Pipeline 5/5 complete -> extracted: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
@@ -275,6 +369,7 @@ def run() -> dict:
         "saved_doubtful": added_doubtful,
         "llm_final_coverage": round(final_coverage, 4),
         "llm_final_fallback_count": final_fallback_count,
-        "exclusion_downgrades_to_doubtful": exclusion_downgrades,
+        "exclusion_to_doubtful": exclusion_to_doubtful,
+        "exclusion_rejected_low_confidence": exclusion_rejected_low_confidence,
         "supabase_sync": db_sync_ok,
     }
