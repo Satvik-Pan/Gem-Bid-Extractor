@@ -21,51 +21,62 @@ PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 EXCEL_FILE = OUTPUT_DIR / "Extracted_bids.xlsx"
 DOUBTFUL_FILE = OUTPUT_DIR / "doubtful_bids.xlsx"
 PROCESSED_FILE = DATA_DIR / "processed_bids.json"
-FEEDBACK_FILE = DATA_DIR / "feedback_logs.json"
-THRESHOLDS_FILE = DATA_DIR / "thresholds.json"
-WATCHLIST_FILE = DATA_DIR / "false_negative_watchlist.json"
 LOG_FILE = LOG_DIR / "scraper.log"
 RUN_STATUS_FILE = DATA_DIR / "last_run_status.json"
 SYNC_QUEUE_FILE = DATA_DIR / "db_sync_queue.jsonl"
 DNS_CACHE_FILE = DATA_DIR / "dns_cache.json"
 
 KEYWORDS_FILE = BASE_DIR / "src" / "gem_bid_extractor" / "keywords.csv"
-MAX_PAGES_PER_PIPELINE = 5
-MAX_PAGES_PER_PIPELINE = int(os.environ.get("MAX_PAGES_PER_PIPELINE", str(MAX_PAGES_PER_PIPELINE)))
 
+# ---------------------------------------------------------------------------
+# Pipeline 1: Keyword-based search with date filtering
+# ---------------------------------------------------------------------------
+# How many days back from today to include bids by Start Date.
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "3"))
+# Safety cap: stop paginating after this many pages per keyword.
+MAX_PAGES_PER_KEYWORD = int(os.environ.get("MAX_PAGES_PER_KEYWORD", "80"))
+
+# ---------------------------------------------------------------------------
+# Inclusion keywords — searched one-by-one on GEM portal
+# ---------------------------------------------------------------------------
 DEFAULT_INCLUSION_KEYWORDS = [
-    "router",
-    "ngfw",
-    "firewall",
-    "fire wall",
-    "vpn",
-    "utm",
-    "next generation firewall",
-    "unified threat manager",
-    "network security",
-    "web application firewall",
-    "waf",
+    "Router",
+    "NGFW",
+    "FIREWALL",
+    "FIRE WALL",
+    "VPN",
+    "UTM",
+    "Next Generation Firewall",
+    "UNIFIED Threat Manager",
+    "Network Security",
+    "Web Application Firewall",
+    "WAF",
 ]
 
+# ---------------------------------------------------------------------------
+# Exclusion keywords — checked in bid document PDFs
+# ---------------------------------------------------------------------------
 DEFAULT_EXCLUSION_KEYWORDS = [
-    "ips", "load balancer", "nextgen", "next", "unified", "sdwan", "sd wan", "software define wan",
-    "dns", "intrusion", "llb", "slb", "web security", "threat", "internet", "gateway", "perimeter",
-    "endpoint", "eps", "malware", "ransomware", "ipsec", "edge", "cyber security", "virus", "aaa",
-    "firepower", "asa", "bandwidth", "renewal", "authentication", "lan", "armynet", "domain",
-    "anti-apt", "anti-atp", "sophos", "gajshield", "checkpoint", "anexgate", "tacitine", "fortinet",
-    "fortigate", "paloalto", "quickheal", "forcepoint", "cisco", "juniper", "sonicwall", "trendmicro",
-    "mcafee", "radware", "array networks", "haltdos", "ddos", "trellix", "data loss prevention",
-    "scada/ scada firewall",
+    "IPS", "Load Balancer", "NextGen", "Next", "UNIFIED", "SDWAN", "SD WAN",
+    "Software Define WAN", "DNS", "Intrusion", "LLB", "SLB", "Web Security",
+    "Threat", "Internet", "Gateway", "Perimeter", "Endpoint", "EPS", "Malware",
+    "Ransomware", "IPSec", "Edge", "Cyber Security", "Virus", "AAA", "Firepower",
+    "ASA", "Bandwidth", "Renewal", "Authentication", "LAN", "Armynet", "Domain",
+    "Anti-APT", "Anti-ATP", "Sophos", "Gajshield", "Checkpoint", "Anexgate",
+    "Tacitine", "Fortinet", "Fortigate", "PaloAlto", "Quickheal", "Forcepoint",
+    "CISCO", "Juniper", "Sonicwall", "TrendMicro", "Mcafee", "Radware",
+    "Array Networks", "Haltdos", "DDoS", "Trellix", "Data Loss Prevention",
+    "Scada/ Scada Firewall",
 ]
 
 
 def _normalize_term(term: str) -> str:
-    return " ".join(term.strip().lower().split())
+    return " ".join(term.strip().split())
 
 
 def _load_keyword_sets() -> tuple[list[str], list[str]]:
     if not KEYWORDS_FILE.exists():
-        return DEFAULT_INCLUSION_KEYWORDS, DEFAULT_EXCLUSION_KEYWORDS
+        return list(DEFAULT_INCLUSION_KEYWORDS), list(DEFAULT_EXCLUSION_KEYWORDS)
 
     inclusion: list[str] = []
     exclusion: list[str] = []
@@ -80,54 +91,53 @@ def _load_keyword_sets() -> tuple[list[str], list[str]]:
                 if exc:
                     exclusion.append(exc)
     except OSError:
-        return DEFAULT_INCLUSION_KEYWORDS, DEFAULT_EXCLUSION_KEYWORDS
+        return list(DEFAULT_INCLUSION_KEYWORDS), list(DEFAULT_EXCLUSION_KEYWORDS)
 
     inclusion = inclusion or list(DEFAULT_INCLUSION_KEYWORDS)
-    exclusion = exclusion or DEFAULT_EXCLUSION_KEYWORDS
-    # Preserve CSV order for inclusion (exactly the 11 product terms); dedupe only.
+    exclusion = exclusion or list(DEFAULT_EXCLUSION_KEYWORDS)
+
+    # Dedupe preserving order
     inc_seen: set[str] = set()
-    inclusion_ordered: list[str] = []
+    inclusion_deduped: list[str] = []
     for t in inclusion:
         k = t.lower()
-        if k in inc_seen:
-            continue
-        inc_seen.add(k)
-        inclusion_ordered.append(t)
-    inclusion = inclusion_ordered or list(DEFAULT_INCLUSION_KEYWORDS)
-    return inclusion, sorted(set(exclusion))
+        if k not in inc_seen:
+            inc_seen.add(k)
+            inclusion_deduped.append(t)
+
+    exc_seen: set[str] = set()
+    exclusion_deduped: list[str] = []
+    for t in exclusion:
+        k = t.lower()
+        if k not in exc_seen:
+            exc_seen.add(k)
+            exclusion_deduped.append(t)
+
+    return inclusion_deduped or list(DEFAULT_INCLUSION_KEYWORDS), exclusion_deduped or list(DEFAULT_EXCLUSION_KEYWORDS)
 
 
 INCLUSION_KEYWORDS, EXCLUSION_KEYWORDS = _load_keyword_sets()
-KEYWORDS = INCLUSION_KEYWORDS
 
 COLUMNS = [
     "Category", "Reference No.", "Date", "Name", "Start Date", "Model - Yr", "Quantity",
     "Unit Amount", "Description", "Contact", "EMAIL", "Department",
-    "Pipeline Source", "LLM Confidence", "LLM Reason",
+    "Search Keyword", "Pipeline Source", "Inclusion Hits", "Exclusion Hits",
 ]
 
 GEM_PAGE_URL = "https://bidplus.gem.gov.in/all-bids"
 GEM_API_URL = "https://bidplus.gem.gov.in/all-bids-data"
 SORT_ORDER = "Bid-Start-Date-Latest"
-LOOKBACK_DAYS = 3
 REQUEST_DELAY = (1.0, 2.2)
 MAX_RETRIES = 3
 SESSION_REFRESH_EVERY = 100
 PDF_FETCH_TIMEOUT_SECONDS = int(os.environ.get("PDF_FETCH_TIMEOUT_SECONDS", "25"))
 PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
 SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
-# Pipeline 2: bid is kept in doubtful (if not inclusion hit) when Sonnet confidence is at least this.
-P2_DOUBTFUL_MIN_CONFIDENCE = float(os.environ.get("P2_DOUBTFUL_MIN_CONFIDENCE", "0.35"))
-# Pipeline 4: promote doubtful bid to EXTRACTED when Sonnet returns EXTRACTED with at least this confidence.
-P4_PROMOTE_EXTRACTED_MIN_CONFIDENCE = float(os.environ.get("P4_PROMOTE_EXTRACTED_MIN_CONFIDENCE", "0.70"))
-# Pipeline 4: reject doubtful bid when Sonnet marks DOUBTFUL with confidence below this.
-P4_REJECT_BELOW_CONFIDENCE = float(os.environ.get("P4_REJECT_BELOW_CONFIDENCE", "0.20"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 ANTHROPIC_DNS_CACHE_TTL_SECONDS = int(os.environ.get("ANTHROPIC_DNS_CACHE_TTL_SECONDS", "21600"))
-LLM_BATCH_SIZE = 35
 
 DB_DSN = os.environ.get("SUPABASE_DB_DSN", "")
 DB_HOST = os.environ.get("SUPABASE_DB_HOST", "")
@@ -136,23 +146,3 @@ DB_NAME = os.environ.get("SUPABASE_DB_NAME", "postgres")
 DB_USER = os.environ.get("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.environ.get("SUPABASE_DB_PASSWORD", "")
 DB_SSLMODE = os.environ.get("SUPABASE_DB_SSLMODE", "require")
-
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-EMBEDDING_REF_TEXTS = [
-    "cybersecurity procurement firewall management network security",
-    "soc managed security services threat monitoring",
-    "endpoint security edr antivirus malware defense",
-    "vpn secure remote access zero trust",
-    "siem log monitoring incident response",
-    "penetration testing vulnerability assessment security audit",
-]
-
-EXCLUDE_DOMAINS = {
-    "construction", "civil", "furniture", "food", "agriculture", "medical", "surgical",
-    "vehicle", "automotive", "textile", "stationery", "hospital equipment",
-}
-
-RELEVANT_THRESHOLD_DEFAULT = 55.0
-DOUBTFUL_THRESHOLD_DEFAULT = 35.0
-WATCHLIST_SCORE_MIN = 45.0
-WATCHLIST_EMBEDDING_MIN = 0.55

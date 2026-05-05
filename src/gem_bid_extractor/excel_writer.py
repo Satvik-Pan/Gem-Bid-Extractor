@@ -19,14 +19,6 @@ class ExcelWriter:
         self.path = path
 
     @staticmethod
-    def _looks_like_ref(value: str) -> bool:
-        return bool(re.search(r"GEM/\d{4}/[A-Z]/\d+", value or ""))
-
-    @staticmethod
-    def _looks_like_date(value: str) -> bool:
-        return bool(re.search(r"\d{2}-\d{2}-\d{4}", value or ""))
-
-    @staticmethod
     def _create_empty_workbook(path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         wb = Workbook()
@@ -45,54 +37,6 @@ class ExcelWriter:
     def _current_header(ws) -> list[str]:
         return [str(c.value or "").strip() for c in ws[1][: len(COLUMNS)]]
 
-    def _migrate_legacy_rows(self, ws) -> list[dict]:
-        migrated: list[dict] = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            vals = ["" if v is None else str(v).strip() for v in row]
-            vals += [""] * (16 - len(vals))
-
-            ref = vals[1] if self._looks_like_ref(vals[1]) else ""
-            if not ref:
-                for v in vals:
-                    if self._looks_like_ref(v):
-                        ref = v
-                        break
-            if not ref:
-                continue
-
-            date_val = vals[2] if self._looks_like_date(vals[2]) else ""
-            if not date_val:
-                for v in vals:
-                    if self._looks_like_date(v):
-                        date_val = v
-                        break
-
-            name = vals[0] or vals[3]
-            description = vals[8] or vals[3] or name
-            department = vals[11] or vals[4]
-            confidence = vals[13] or ""
-
-            migrated.append(
-                {
-                    "Category": "",
-                    "Reference No.": ref,
-                    "Date": date_val,
-                    "Name": name,
-                    "Start Date": "",
-                    "Model - Yr": "",
-                    "Quantity": "",
-                    "Unit Amount": "",
-                    "Description": description,
-                    "Contact": "",
-                    "EMAIL": "",
-                    "Department": department,
-                    "Pipeline Source": "legacy_migrated",
-                    "LLM Confidence": confidence,
-                    "LLM Reason": "Migrated from legacy workbook layout",
-                }
-            )
-        return migrated
-
     def _ensure_layout(self) -> None:
         if not self.path.exists():
             self._create_empty_workbook(self.path)
@@ -104,29 +48,9 @@ class ExcelWriter:
             wb.close()
             return
 
-        legacy_rows = self._migrate_legacy_rows(ws)
+        # Header mismatch: recreate with correct columns
         wb.close()
-
         self._create_empty_workbook(self.path)
-        if not legacy_rows:
-            return
-
-        wb2 = load_workbook(self.path)
-        ws2 = wb2.active
-        seen: set[str] = set()
-        for bid in legacy_rows:
-            ref = bid.get("Reference No.", "")
-            if not ref or ref in seen:
-                continue
-            seen.add(ref)
-            ws2.append([bid.get(col, "") for col in COLUMNS])
-            for c in ws2[ws2.max_row]:
-                c.font = self._CFONT
-                c.border = self._BORDER
-                c.alignment = Alignment(vertical="center", wrap_text=True)
-        ws2.auto_filter.ref = ws2.dimensions
-        wb2.save(self.path)
-        wb2.close()
 
     def _existing_refs(self) -> set[str]:
         self._ensure_layout()

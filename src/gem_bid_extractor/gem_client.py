@@ -5,7 +5,7 @@ import logging
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
@@ -22,7 +22,8 @@ from .pdf_reader import extract_pdf_text
 from .settings import (
     GEM_API_URL,
     GEM_PAGE_URL,
-    MAX_PAGES_PER_PIPELINE,
+    LOOKBACK_DAYS,
+    MAX_PAGES_PER_KEYWORD,
     MAX_RETRIES,
     PDF_CACHE_DIR,
     PDF_FETCH_RETRIES,
@@ -73,6 +74,9 @@ class GemScraper:
         self.csrf_token: Optional[str] = None
         self._call_count = 0
 
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
     def init_session(self):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -99,7 +103,14 @@ class GemScraper:
         if self._call_count >= SESSION_REFRESH_EVERY:
             self.init_session()
 
+    # ------------------------------------------------------------------
+    # GEM API search
+    # ------------------------------------------------------------------
     def _search_page(self, keyword: str, page: int) -> dict:
+        """Search GEM portal for a keyword on a specific page.
+
+        Uses 'Contains' search type (fullText), sorted by Bid Start Date Latest.
+        """
         payload = json.dumps(
             {
                 "page": page,
@@ -130,11 +141,14 @@ class GemScraper:
                 data = resp.json()
                 return data if data.get("code") == 200 else {}
             except requests.RequestException as exc:
-                logger.warning("Request attempt %d failed for %s: %s", attempt, keyword, exc)
+                logger.warning("Request attempt %d failed for '%s' p%d: %s", attempt, keyword, page, exc)
                 if attempt < MAX_RETRIES:
                     time.sleep(2 * attempt)
         return {}
 
+    # ------------------------------------------------------------------
+    # Bid parsing
+    # ------------------------------------------------------------------
     @staticmethod
     def _parse_bid(doc: dict, keyword: str) -> dict:
         category = _val(doc.get("b_category_name", ""))
@@ -166,17 +180,14 @@ class GemScraper:
             "Source URL": f"https://bidplus.gem.gov.in/bidlists/{bid_no}" if bid_no else GEM_PAGE_URL,
             "Bid Doc URL": f"https://bidplus.gem.gov.in/showbidDocument/{parent_bid_id}" if parent_bid_id else "",
             "Bid ID": str(_val(doc.get("b_id", ""))),
-            "_keyword": keyword,
+            "Search Keyword": keyword,
             "_start_dt": start_raw,
             "_end_dt": end_raw,
-            "_is_ra_listing": bool(ra_no),
         }
 
-    @staticmethod
-    def _is_actionable_bid(doc: dict) -> bool:
-        bid_no = str(_val(doc.get("b_bid_number_parent", ""))).strip()
-        return bid_no.startswith("GEM/") and "/B/" in bid_no
-
+    # ------------------------------------------------------------------
+    # Selenium / PDF helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _sanitize_filename(name: str) -> str:
         return re.sub(r"[^a-zA-Z0-9._-]+", "_", name).strip("_")
@@ -221,23 +232,21 @@ class GemScraper:
         return ""
 
     def _sync_session_cookies_from_driver(self, driver: webdriver.Chrome) -> None:
-        """Copy browser cookies into the requests session (needed after Selenium hits GEM)."""
+        """Copy browser cookies into the requests session."""
         for c in driver.get_cookies():
             name = c.get("name")
             if not name:
                 continue
             try:
                 self.session.cookies.set(
-                    name,
-                    c.get("value", ""),
-                    domain=c.get("domain"),
-                    path=c.get("path") or "/",
+                    name, c.get("value", ""),
+                    domain=c.get("domain"), path=c.get("path") or "/",
                 )
             except Exception:
                 self.session.cookies.set(name, c.get("value", ""))
 
     def _try_set_sort_bid_start_latest(self, driver: webdriver.Chrome) -> None:
-        """Best-effort: match portal sort to Bid Start Date latest (API already uses this)."""
+        """Best-effort: match portal sort to Bid Start Date latest."""
         try:
             for sel_el in driver.find_elements(By.TAG_NAME, "select"):
                 try:
@@ -259,6 +268,9 @@ class GemScraper:
         PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         safe_name = self._sanitize_filename(bid_no) or f"bid_{int(time.time())}"
         out_path = PDF_CACHE_DIR / f"{safe_name}.pdf"
+        # Skip if already cached
+        if out_path.exists() and out_path.stat().st_size > 80:
+            return out_path
         try:
             resp = self.session.get(pdf_url, timeout=PDF_FETCH_TIMEOUT_SECONDS, verify=False)
             resp.raise_for_status()
@@ -268,6 +280,98 @@ class GemScraper:
             logger.warning("PDF download failed for %s (%s): %s", bid_no, pdf_url, exc)
             return None
 
+    # ------------------------------------------------------------------
+    # Pipeline 1: Search each inclusion keyword, filter by start date
+    # ------------------------------------------------------------------
+    def search_keyword_with_date_filter(
+        self,
+        keyword: str,
+        lookback_days: int = LOOKBACK_DAYS,
+        seen_refs: set[str] | None = None,
+    ) -> list[dict]:
+        """Search GEM for a single keyword, return bids with start date >= cutoff.
+
+        Paginates until start dates fall before cutoff or safety cap hit.
+        Skips refs already in seen_refs (cross-keyword dedup).
+        """
+        if seen_refs is None:
+            seen_refs = set()
+
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).date()
+        bids: list[dict] = []
+        page = 1
+        stop_paging = False
+
+        while page <= MAX_PAGES_PER_KEYWORD and not stop_paging:
+            data = self._search_page(keyword, page)
+            docs = data.get("response", {}).get("response", {}).get("docs", []) if data else []
+            if not docs:
+                break
+
+            for doc in docs:
+                bid = self._parse_bid(doc, keyword)
+                ref = str(bid.get("Reference No.", "")).strip()
+                if not ref or ref in seen_refs:
+                    continue
+
+                # Check start date against cutoff
+                start_raw = bid.get("_start_dt", "")
+                start_dt = _parse_iso(start_raw) if start_raw else None
+
+                if start_dt:
+                    start_date = start_dt.astimezone(timezone.utc).date()
+                    if start_date < cutoff_date:
+                        # Sorted latest-first: all remaining will be older
+                        stop_paging = True
+                        break
+
+                seen_refs.add(ref)
+                bids.append(bid)
+
+            if stop_paging:
+                break
+            page += 1
+            time.sleep(random.uniform(*REQUEST_DELAY))
+
+        if page > MAX_PAGES_PER_KEYWORD:
+            logger.warning("Keyword '%s' hit page cap (%d pages).", keyword, MAX_PAGES_PER_KEYWORD)
+
+        return bids
+
+    def search_all_inclusion_keywords(
+        self,
+        keywords: list[str],
+        lookback_days: int = LOOKBACK_DAYS,
+    ) -> list[dict]:
+        """Search each inclusion keyword one by one, dedup across keywords.
+
+        Returns all bids with Start Date >= (today - lookback_days).
+        """
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).date()
+        logger.info(
+            "Pipeline 1: Searching %d inclusion keywords, cutoff date: %s",
+            len(keywords), cutoff_date.isoformat(),
+        )
+
+        all_bids: list[dict] = []
+        seen_refs: set[str] = set()
+
+        for i, kw in enumerate(keywords, 1):
+            logger.info("Pipeline 1: [%d/%d] Searching keyword: '%s'", i, len(keywords), kw)
+            kw_bids = self.search_keyword_with_date_filter(kw, lookback_days, seen_refs)
+            all_bids.extend(kw_bids)
+            logger.info("Pipeline 1: [%d/%d] '%s' -> %d new bids (total so far: %d)",
+                         i, len(keywords), kw, len(kw_bids), len(all_bids))
+
+            if i < len(keywords):
+                time.sleep(random.uniform(*REQUEST_DELAY))
+
+        logger.info("Pipeline 1: Total %d unique bids from %d keywords", len(all_bids), len(keywords))
+        return all_bids
+
+    # ------------------------------------------------------------------
+    # PDF enrichment: download PDFs and extract text
+    # ------------------------------------------------------------------
     def enrich_with_pdf_text(self, bids: list[dict]) -> dict[str, int]:
         if not bids:
             return {"downloaded": 0, "failed": 0, "skipped": 0}
@@ -284,7 +388,7 @@ class GemScraper:
             return {"downloaded": 0, "failed": len(bids), "skipped": 0}
 
         try:
-            # Same-origin session as the portal: open all-bids, align sort, then reuse cookies per bid.
+            # Warm up session
             try:
                 driver.get(GEM_PAGE_URL)
                 time.sleep(1.2)
@@ -293,10 +397,14 @@ class GemScraper:
             except Exception as exc:
                 logger.warning("GEM portal warm-up failed (continuing): %s", exc)
 
-            for bid in bids:
+            for idx, bid in enumerate(bids, 1):
                 bid_no = str(bid.get("Bid No.", "")).strip() or str(bid.get("Reference No.", "")).strip()
                 bid_url = str(bid.get("Source URL", "")).strip()
                 bid_doc_url = str(bid.get("Bid Doc URL", "")).strip()
+
+                if idx % 25 == 0:
+                    logger.info("PDF download progress: %d/%d", idx, len(bids))
+
                 if not bid_no and not bid_doc_url:
                     skipped += 1
                     bid["PDF Text"] = ""
@@ -306,7 +414,7 @@ class GemScraper:
                 pdf_path: Path | None = None
                 pdf_text = ""
 
-                # Primary path: navigate to the Bid Doc URL in-browser (same as following the Bid No link), then download with session cookies.
+                # Try Bid Doc URL first
                 if bid_doc_url:
                     for attempt in range(PDF_FETCH_RETRIES + 2):
                         try:
@@ -319,7 +427,7 @@ class GemScraper:
                                 if pdf_text:
                                     break
                         except (TimeoutException, WebDriverException) as exc:
-                            logger.debug("Selenium bid doc attempt %s for %s: %s", attempt, bid_no, exc)
+                            logger.debug("Bid doc attempt %s for %s: %s", attempt, bid_no, exc)
                         pdf_path = None
                         pdf_text = ""
 
@@ -330,6 +438,7 @@ class GemScraper:
                     bid["Description"] = pdf_text[:1500]
                     continue
 
+                # Fallback: extract PDF link from bid page
                 pdf_link = ""
                 for _ in range(PDF_FETCH_RETRIES + 1):
                     try:
@@ -368,90 +477,6 @@ class GemScraper:
             driver.quit()
 
         return {"downloaded": downloaded, "failed": failed, "skipped": skipped}
-
-    @staticmethod
-    def _within_window(end_dt: Optional[datetime], min_date, max_date) -> bool:
-        if end_dt is None:
-            return True
-        end_date = end_dt.astimezone(timezone.utc).date()
-        return min_date <= end_date <= max_date
-
-    def search_full(self, max_pages: int = MAX_PAGES_PER_PIPELINE, target_rows: int = 50) -> list[dict]:
-        bids: list[dict] = []
-        page = 1
-        while page <= max_pages:
-            data = self._search_page("", page)
-            docs = data.get("response", {}).get("response", {}).get("docs", []) if data else []
-            if not docs:
-                break
-
-            for doc in docs:
-                bid = self._parse_bid(doc, "")
-                bid["_pipeline"] = "full"
-                bids.append(bid)
-                if len(bids) >= target_rows:
-                    break
-            if len(bids) >= target_rows:
-                break
-
-            page += 1
-            time.sleep(random.uniform(*REQUEST_DELAY))
-
-        if page > max_pages and len(bids) < target_rows:
-            logger.warning("Pipeline full feed hit page cap (%d). Consider increasing MAX_PAGES_PER_PIPELINE.", max_pages)
-        logger.info("Fetched %d raw bids from first %d pages", len(bids), max_pages)
-        return bids
-
-    def search_keyword(self, keyword: str, cutoff: datetime, seen_ids: set[str]) -> list[dict]:
-        bids: list[dict] = []
-        cutoff_date = cutoff.astimezone(timezone.utc).date()
-        today_date = datetime.now(timezone.utc).date()
-        page = 1
-        while page <= MAX_PAGES_PER_PIPELINE:
-            data = self._search_page(keyword, page)
-            docs = data.get("response", {}).get("response", {}).get("docs", []) if data else []
-            if not docs:
-                break
-
-            stop = False
-            for doc in docs:
-                bid_id = str(_val(doc.get("b_id", "")))
-                if not bid_id or bid_id in seen_ids:
-                    continue
-                end_raw = _val(doc.get("final_end_date_sort", ""))
-                end_dt = _parse_iso(end_raw) if end_raw else None
-                if end_dt and end_dt < cutoff:
-                    stop = True
-                    break
-                if not self._within_window(end_dt, cutoff_date, today_date):
-                    continue
-                seen_ids.add(bid_id)
-                bid = self._parse_bid(doc, keyword)
-                bid["_pipeline"] = "keyword"
-                bids.append(bid)
-
-            if stop:
-                break
-            page += 1
-            time.sleep(random.uniform(*REQUEST_DELAY))
-        if page > MAX_PAGES_PER_PIPELINE:
-            logger.warning(
-                "Keyword search '%s' hit page cap (%d). Consider increasing MAX_PAGES_PER_PIPELINE.",
-                keyword,
-                MAX_PAGES_PER_PIPELINE,
-            )
-        return bids
-
-    def search_all(self, keywords: list[str], cutoff: datetime) -> list[dict]:
-        all_bids: list[dict] = []
-        seen_ids: set[str] = set()
-        for i, kw in enumerate(keywords, 1):
-            logger.info("[%d/%d] %s", i, len(keywords), kw)
-            all_bids.extend(self.search_keyword(kw, cutoff, seen_ids))
-            if i < len(keywords):
-                time.sleep(random.uniform(*REQUEST_DELAY))
-        logger.info("Fetched %d unique bids", len(all_bids))
-        return all_bids
 
     def close(self):
         self.session.close()

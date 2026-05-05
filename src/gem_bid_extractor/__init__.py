@@ -1,3 +1,1 @@
-from .pipeline import run
-
-__all__ = ["run"]
+"""GEM Bid Extractor — keyword-based search with exclusion filtering."""

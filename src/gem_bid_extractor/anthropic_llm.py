@@ -4,7 +4,6 @@ import json
 import logging
 import re
 import time
-from typing import Literal
 from urllib.parse import urlparse
 
 import requests
@@ -16,29 +15,75 @@ from .settings import (
     ANTHROPIC_DNS_CACHE_TTL_SECONDS,
     ANTHROPIC_MODEL,
     DNS_CACHE_FILE,
-    LLM_BATCH_SIZE,
 )
 
-_PREFILTER_PROMPT = """You are doing cybersecurity pre-filtering for Indian government bids (network security, firewalls, VPN, SOC, PKI, etc.).
-Return strict JSON only:
-{"results":[{"ref":"<Reference No.>","decision":"YES"|"NO","confidence":0.0}]}
+# ---------------------------------------------------------------------------
+# Pipeline 2 prompt: Deep PDF analysis for INCLUSION keyword detection
+# ---------------------------------------------------------------------------
+_PIPELINE2_INCLUSION_PROMPT = """You are a cybersecurity bid analyst. You are given the FULL text extracted from a government bid document PDF.
 
-Rules:
-- YES only when the bid plausibly involves cybersecurity products, services, or security-relevant IT (e.g. firewalls, NGFW, VPN, IAM/PKI, security audit, SOC, encryption hardware tied to security).
-- NO for clearly unrelated physical goods and services: cables, wires, vehicles, janitorial/cleaning, food/ration, fire extinguishers (unless explicitly tied to network security systems), explosives for civil works, generic office paper/consumables, medical/ambulance, pumps, mechanical parts, industrial commodities, unless the text clearly ties them to cybersecurity scope.
-- If uncertain but a reasonable cyber angle exists, YES with moderate confidence; if the text is generic procurement with no security angle, NO with low confidence.
-- Return exactly one result per input ref.
+Your task: Deeply analyze the ENTIRE document and determine if ANY of the following INCLUSION keywords appear in the bid document, either explicitly or as part of the bid's technical requirements/scope.
+
+INCLUSION KEYWORDS:
+- Router
+- NGFW
+- FIREWALL
+- FIRE WALL
+- VPN
+- UTM
+- Next Generation Firewall
+- UNIFIED Threat Manager
+- Network Security
+- Web Application Firewall
+- WAF
+
+RULES:
+1. Search the ENTIRE document text thoroughly — headers, scope, BOQ, technical specs, everything.
+2. If you find ANY of these keywords (even one), the bid is RELEVANT.
+3. Match case-insensitively. "firewall", "Firewall", "FIREWALL" all count.
+4. "Next Generation Firewall" and "NGFW" are the same concept — either counts.
+5. Return strict JSON only. No explanations outside the JSON.
+
+Return:
+{"ref": "<Reference No.>", "found": true|false, "matched_keywords": ["keyword1", "keyword2"], "reason": "brief explanation"}
+
+- found=true if ANY inclusion keyword was found in the document.
+- found=false if NONE of the inclusion keywords were found.
+- matched_keywords: list of specific keywords found (empty if none).
 """
 
-_FINAL_CLASS_PROMPT = """You are Pipeline 4 classifier for Indian government bids (cybersecurity relevance only).
-Return strict JSON only:
-{"results":[{"ref":"<Reference No.>","category":"EXTRACTED"|"DOUBTFUL","confidence":0.0,"reason":"short reason"}]}
+# ---------------------------------------------------------------------------
+# Pipeline 3 prompt: Deep PDF analysis for EXCLUSION keyword detection
+# (This is done via regex in the pipeline, but we keep a prompt ready
+#  in case LLM-based exclusion is needed in the future.)
+# ---------------------------------------------------------------------------
 
-Rules:
-- EXTRACTED: clear or strong cybersecurity relevance (network security, firewalls, VPN, PKI/dsc, SOC, security appliances, etc.).
-- DOUBTFUL: some possible but weak/ambiguous security angle; use very low confidence (e.g. under 0.2) when the bid is almost certainly not cybersecurity (office supplies, vehicles, cables, cleaning, food, generic mechanical goods) so downstream rejection gates can drop it.
-- Do **not** label unrelated physical/consumables as EXTRACTED. For clearly non-cyber bids, use DOUBTFUL with **very low confidence** (under 0.15) and a short reason.
-- Return exactly one result per input ref.
+# ---------------------------------------------------------------------------
+# Pipeline 4 prompt: Final confidence scoring for cybersecurity relevance
+# ---------------------------------------------------------------------------
+_PIPELINE4_CONFIDENCE_PROMPT = """You are a cybersecurity bid relevance analyst for a network security company (WiJungle) that sells products like firewalls, NGFW, UTM, VPN appliances, WAF, and routers.
+
+You are given the FULL text extracted from a government bid document PDF. This bid has already passed initial keyword screening — it did NOT contain direct product keywords but also did NOT contain any disqualifying exclusion keywords.
+
+Your task: Deeply analyze the ENTIRE document and determine if this bid is potentially relevant to a cybersecurity/network security company.
+
+SCORING GUIDE:
+- 0.80-1.00: Clearly relevant to cybersecurity/network security even without direct keywords (e.g., security infrastructure, IT security procurement, network appliance procurement)
+- 0.50-0.79: Moderately relevant — has IT/networking components that could involve security products
+- 0.25-0.49: Weakly relevant — tangential connection to IT/networking, could possibly need security products
+- 0.00-0.24: Not relevant — clearly about non-cyber topics (construction, furniture, food, medical, vehicles, stationery, plumbing, cleaning, etc.)
+
+RULES:
+1. Read the ENTIRE document carefully.
+2. Consider the procurement scope, technical specifications, and department context.
+3. Be STRICT: if the bid is about physical goods, construction, or services clearly unrelated to cybersecurity, give a very low score (under 0.20).
+4. Return strict JSON only.
+
+Return:
+{"ref": "<Reference No.>", "confidence": 0.00, "relevant": true|false, "reason": "brief explanation of why this score was given"}
+
+- relevant=true if confidence >= 0.25 (these go to DOUBTFUL column)
+- relevant=false if confidence < 0.25 (these are REJECTED)
 """
 
 logger = logging.getLogger(__name__)
@@ -70,7 +115,7 @@ class AnthropicClaudeClassifier:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        timeout = (15, 140)
+        timeout = (15, 180)  # Increased timeout for deep PDF analysis
 
         try:
             return requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -97,28 +142,13 @@ class AnthropicClaudeClassifier:
             return s
         return s[: max_len - 3] + "..."
 
-    @classmethod
-    def _bid_summary(cls, bid: dict, *, pdf_max: int = 1800, desc_max: int = 140) -> str:
-        desc = cls._safe_snippet(bid.get("Description", ""), desc_max)
-        pdf_text = cls._safe_snippet(bid.get("PDF Text", ""), pdf_max)
-        return (
-            f"Ref: {cls._safe_snippet(bid.get('Reference No.', ''), 120)}\n"
-            f"Bid No: {cls._safe_snippet(bid.get('Bid No.', ''), 80)}\n"
-            f"RA No: {cls._safe_snippet(bid.get('RA No.', ''), 80)}\n"
-            f"Category: {cls._safe_snippet(bid.get('Category', ''), 200)}\n"
-            f"Title: {cls._safe_snippet(bid.get('Name', ''), 500)}\n"
-            f"Description: {desc}\n"
-            f"Department: {cls._safe_snippet(bid.get('Department', ''), 300)}\n"
-            f"PDF Extract: {pdf_text}"
-        )
-
     @staticmethod
     def _extract_json(text: str) -> dict:
         if not isinstance(text, str):
-            return {"results": []}
+            return {}
         text = text.strip()
         if not text:
-            return {"results": []}
+            return {}
         try:
             return json.loads(text)
         except json.JSONDecodeError:
@@ -127,8 +157,8 @@ class AnthropicClaudeClassifier:
                 try:
                     return json.loads(match.group(0))
                 except json.JSONDecodeError:
-                    return {"results": []}
-        return {"results": []}
+                    return {}
+        return {}
 
     @staticmethod
     def _read_text(data_json: dict) -> str:
@@ -143,23 +173,19 @@ class AnthropicClaudeClassifier:
                     parts.append(txt)
         return "".join(parts)
 
-    def _call_messages_api(
+    def _call_api(
         self,
-        bids: list[dict],
         system_prompt: str,
-        max_tokens: int = 900,
-        *,
-        pdf_max: int = 1800,
-        desc_max: int = 140,
-    ) -> dict[str, dict]:
+        user_content: str,
+        max_tokens: int = 1200,
+    ) -> dict:
+        """Make a single Anthropic API call and return parsed JSON response."""
         if not self.enabled:
             raise RuntimeError("Anthropic classifier is not configured. Set ANTHROPIC_API_KEY, ANTHROPIC_MODEL, and ANTHROPIC_BASE_URL.")
-        if not bids:
-            return {}
 
-        user_content = "\n\n".join(self._bid_summary(b, pdf_max=pdf_max, desc_max=desc_max) for b in bids)
-        if len(user_content) > 180_000:
-            user_content = user_content[:180_000] + "\n\n[truncated]"
+        if len(user_content) > 190_000:
+            user_content = user_content[:190_000] + "\n\n[truncated]"
+
         payload = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -218,117 +244,72 @@ class AnthropicClaudeClassifier:
             raise RuntimeError(f"Anthropic API call failed after retries: {last_exc}") from last_exc
         raise RuntimeError("Anthropic API call failed after retries")
 
-    @staticmethod
-    def _index_by_ref(bids: list[dict]) -> dict[str, dict]:
-        out: dict[str, dict] = {}
-        for bid in bids:
-            ref = str(bid.get("Reference No.", "")).strip()
-            if ref:
-                out[ref] = bid
-        return out
+    # ------------------------------------------------------------------
+    # Pipeline 2: Check ONE bid's PDF for inclusion keywords via LLM
+    # ------------------------------------------------------------------
+    def check_inclusion_keywords(self, bid: dict) -> dict:
+        """Analyze a single bid's PDF text for inclusion keywords.
 
-    def prefilter_batch(self, bids: list[dict]) -> dict[str, dict]:
-        results: dict[str, dict] = {}
-        pending_map = self._index_by_ref(bids)
+        Returns:
+            {"found": bool, "matched_keywords": [...], "reason": "..."}
+        """
+        ref = self._safe_snippet(bid.get("Reference No.", ""), 120)
+        pdf_text = self._safe_snippet(bid.get("PDF Text", ""), 50000)  # Send substantial PDF content
+        name = self._safe_snippet(bid.get("Name", ""), 500)
+        category = self._safe_snippet(bid.get("Category", ""), 200)
+        department = self._safe_snippet(bid.get("Department", ""), 300)
 
-        for attempt in range(1, 4):
-            if not pending_map:
-                break
-            payload_bids = list(pending_map.values())
-            max_tokens = min(2500, max(700, len(payload_bids) * 40))
-            data = self._call_messages_api(payload_bids, _PREFILTER_PROMPT, max_tokens=max_tokens, pdf_max=1800, desc_max=140)
-            for item in data.get("results", []):
-                ref = item.get("ref", "")
-                decision = str(item.get("decision", "")).upper()
-                conf = item.get("confidence")
-                if ref and decision in {"YES", "NO"}:
-                    try:
-                        c_val = float(conf)
-                    except (TypeError, ValueError):
-                        c_val = 0.5
-                    results[ref] = {"ref": ref, "decision": decision, "confidence": max(0.0, min(1.0, c_val))}
-                    pending_map.pop(ref, None)
+        user_content = (
+            f"Reference No.: {ref}\n"
+            f"Title: {name}\n"
+            f"Category: {category}\n"
+            f"Department: {department}\n\n"
+            f"=== FULL BID DOCUMENT TEXT ===\n{pdf_text}"
+        )
 
-            if pending_map and attempt < 3:
-                logger.warning("Prefilter missing refs after attempt %d: %d", attempt, len(pending_map))
-                time.sleep(min(10, attempt * 2))
+        result = self._call_api(_PIPELINE2_INCLUSION_PROMPT, user_content, max_tokens=800)
 
-        if pending_map:
-            missing_refs = sorted(pending_map.keys())
-            raise RuntimeError(f"Anthropic response missing refs: {', '.join(missing_refs[:5])}")
+        return {
+            "found": bool(result.get("found", False)),
+            "matched_keywords": result.get("matched_keywords", []),
+            "reason": str(result.get("reason", ""))[:500],
+        }
 
-        return results
+    # ------------------------------------------------------------------
+    # Pipeline 4: Score ONE bid's PDF for cybersecurity relevance
+    # ------------------------------------------------------------------
+    def score_relevance(self, bid: dict) -> dict:
+        """Analyze a single bid's PDF text and score its cybersecurity relevance.
 
-    def final_classify_batch(self, bids: list[dict]) -> dict[str, dict]:
-        results: dict[str, dict] = {}
-        pending_map = self._index_by_ref(bids)
+        Returns:
+            {"confidence": float, "relevant": bool, "reason": "..."}
+        """
+        ref = self._safe_snippet(bid.get("Reference No.", ""), 120)
+        pdf_text = self._safe_snippet(bid.get("PDF Text", ""), 50000)  # Send substantial PDF content
+        name = self._safe_snippet(bid.get("Name", ""), 500)
+        category = self._safe_snippet(bid.get("Category", ""), 200)
+        department = self._safe_snippet(bid.get("Department", ""), 300)
+        desc = self._safe_snippet(bid.get("Description", ""), 300)
 
-        for attempt in range(1, 4):
-            if not pending_map:
-                break
-            payload_bids = list(pending_map.values())
-            max_tokens = min(5000, max(1400, len(payload_bids) * 140))
-            data = self._call_messages_api(
-                payload_bids,
-                _FINAL_CLASS_PROMPT,
-                max_tokens=max_tokens,
-                pdf_max=900,
-                desc_max=100,
-            )
-            for item in data.get("results", []):
-                ref = item.get("ref", "")
-                category = str(item.get("category", "")).upper()
-                conf = item.get("confidence")
-                reason = str(item.get("reason", "")).strip()
-                if ref and category in {"EXTRACTED", "DOUBTFUL"}:
-                    try:
-                        c_val = float(conf)
-                    except (TypeError, ValueError):
-                        c_val = 0.5
-                    results[ref] = {
-                        "ref": ref,
-                        "category": category,
-                        "confidence": max(0.0, min(1.0, c_val)),
-                        "reason": reason[:300],
-                    }
-                    pending_map.pop(ref, None)
+        user_content = (
+            f"Reference No.: {ref}\n"
+            f"Title: {name}\n"
+            f"Category: {category}\n"
+            f"Department: {department}\n"
+            f"Description: {desc}\n\n"
+            f"=== FULL BID DOCUMENT TEXT ===\n{pdf_text}"
+        )
 
-            if pending_map and attempt < 3:
-                logger.warning("Final classify missing refs after attempt %d: %d", attempt, len(pending_map))
-                time.sleep(min(10, attempt * 2))
+        result = self._call_api(_PIPELINE4_CONFIDENCE_PROMPT, user_content, max_tokens=800)
 
-        if pending_map:
-            missing_refs = sorted(pending_map.keys())
-            raise RuntimeError(f"Anthropic response missing refs: {', '.join(missing_refs[:5])}")
+        try:
+            conf = float(result.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
 
-        return results
-
-    def _run_in_batches(self, bids: list[dict], mode: Literal["prefilter", "final"]) -> dict[str, dict]:
-        if not self.enabled:
-            raise RuntimeError("Anthropic classifier is not configured. Set ANTHROPIC_API_KEY, ANTHROPIC_MODEL, and ANTHROPIC_BASE_URL.")
-
-        results: dict[str, dict] = {}
-        total = len(bids)
-        batch_size = LLM_BATCH_SIZE if mode == "prefilter" else max(4, min(8, LLM_BATCH_SIZE // 5))
-        total_batches = (total + batch_size - 1) // batch_size if total else 0
-
-        for i in range(0, total, batch_size):
-            chunk = bids[i : i + batch_size]
-            if mode == "prefilter":
-                logger.info("LLM prefilter batch %d/%d", (i // batch_size) + 1, total_batches)
-                batch_results = self.prefilter_batch(chunk)
-            else:
-                logger.info("LLM final classify batch %d/%d", (i // batch_size) + 1, total_batches)
-                batch_results = self.final_classify_batch(chunk)
-            results.update(batch_results)
-            # Queue-like pacing to reduce API burst traffic and 429 rates.
-            if i + batch_size < total:
-                time.sleep(3.0)
-
-        return results
-
-    def prefilter(self, bids: list[dict]) -> dict[str, dict]:
-        return self._run_in_batches(bids, "prefilter")
-
-    def final_classify(self, bids: list[dict]) -> dict[str, dict]:
-        return self._run_in_batches(bids, "final")
+        return {
+            "confidence": round(conf, 3),
+            "relevant": bool(result.get("relevant", conf >= 0.25)),
+            "reason": str(result.get("reason", ""))[:500],
+        }

@@ -15,14 +15,11 @@ from gem_bid_extractor.pipeline import run
 from gem_bid_extractor.settings import (
     DOUBTFUL_FILE,
     EXCEL_FILE,
-    FEEDBACK_FILE,
     LOG_FILE,
     PDF_CACHE_DIR,
     PROCESSED_FILE,
     RUN_STATUS_FILE,
     SYNC_QUEUE_FILE,
-    THRESHOLDS_FILE,
-    WATCHLIST_FILE,
 )
 from gem_bid_extractor.supabase_store import SupabaseStore
 
@@ -32,7 +29,9 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.StreamHandler(sys.stdout),
+            logging.StreamHandler(
+                open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
+            ),
             logging.FileHandler(LOG_FILE, encoding="utf-8"),
         ],
     )
@@ -44,9 +43,6 @@ def full_reset(logger: logging.Logger) -> None:
         PROCESSED_FILE,
         SYNC_QUEUE_FILE,
         RUN_STATUS_FILE,
-        FEEDBACK_FILE,
-        THRESHOLDS_FILE,
-        WATCHLIST_FILE,
         EXCEL_FILE,
         DOUBTFUL_FILE,
     ):
