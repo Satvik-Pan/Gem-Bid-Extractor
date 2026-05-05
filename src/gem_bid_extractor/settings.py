@@ -116,18 +116,10 @@ SESSION_REFRESH_EVERY = 100
 PDF_FETCH_TIMEOUT_SECONDS = int(os.environ.get("PDF_FETCH_TIMEOUT_SECONDS", "25"))
 PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
 SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
-# Pipeline 5: if a bid matches exclusion keywords but not inclusion, reject when final LLM confidence is below this.
-EXCLUSION_REJECT_IF_CONFIDENCE_BELOW = float(
-    os.environ.get("EXCLUSION_REJECT_IF_CONFIDENCE_BELOW", "0.4")
-)
-# Pipeline 5: DOUBTFUL + no inclusion keyword + final LLM confidence below this → reject (not on portal).
-FINAL_DOUBTFUL_REJECT_IF_NO_INCLUSION_BELOW = float(
-    os.environ.get("FINAL_DOUBTFUL_REJECT_IF_NO_INCLUSION_BELOW", "0.22")
-)
-# If final LLM says EXTRACTED with at least this confidence, keep EXTRACTED even when exclusion keywords hit.
-LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN = float(
-    os.environ.get("LLM_EXTRACTED_OVERRIDE_EXCLUSION_MIN", "0.72")
-)
+# Pipeline 2 keep-gate (recall-oriented): allow YES decisions and mid-confidence possible cyber bids.
+P4_PREFILTER_MIN_CONFIDENCE = float(os.environ.get("P4_PREFILTER_MIN_CONFIDENCE", "0.35"))
+# Pipeline 4 reject-gate for doubtful bids with weak confidence and no inclusion signal.
+P4_DOUBTFUL_REJECT_BELOW = float(os.environ.get("P4_DOUBTFUL_REJECT_BELOW", "0.20"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")

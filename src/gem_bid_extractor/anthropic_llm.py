@@ -30,13 +30,13 @@ Rules:
 - Return exactly one result per input ref.
 """
 
-_FINAL_CLASS_PROMPT = """You are the final classifier for Indian government bids (cybersecurity relevance only).
+_FINAL_CLASS_PROMPT = """You are Pipeline 4 classifier for Indian government bids (cybersecurity relevance only).
 Return strict JSON only:
 {"results":[{"ref":"<Reference No.>","category":"EXTRACTED"|"DOUBTFUL","confidence":0.0,"reason":"short reason"}]}
 
 Rules:
 - EXTRACTED: clear or strong cybersecurity relevance (network security, firewalls, VPN, PKI/dsc, SOC, security appliances, etc.).
-- DOUBTFUL: some possible but weak/ambiguous security angle; use a **low confidence (e.g. under 0.2)** when the bid is almost certainly not cybersecurity (office supplies, vehicles, cables, cleaning, food, generic mechanical goods) so downstream rules can drop it.
+- DOUBTFUL: some possible but weak/ambiguous security angle; use very low confidence (e.g. under 0.2) when the bid is almost certainly not cybersecurity (office supplies, vehicles, cables, cleaning, food, generic mechanical goods) so downstream rejection gates can drop it.
 - Do **not** label unrelated physical/consumables as EXTRACTED. For clearly non-cyber bids, use DOUBTFUL with **very low confidence** (under 0.15) and a short reason.
 - Return exactly one result per input ref.
 """

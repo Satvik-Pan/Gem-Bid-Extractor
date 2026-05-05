@@ -1,15 +1,14 @@
 # Gem Bid Extractor
 
-Cybersecurity bid extractor with a 5-stage pipeline, strict Anthropic classification, append-only Excel outputs, and a Supabase-backed operations dashboard.
+Cybersecurity bid extractor with a 4-stage pipeline, strict Anthropic classification, append-only Excel outputs, and a Supabase-backed operations dashboard.
 
 ## Architecture
 
 1. Pipeline 1: fetch GEM bids from the first 5 pages of `all-bids` with `Bid-Start-Date-Latest`, keep actionable `Bid No` entries, and exclude RA/non-actionable rows.
 2. Pipeline 1 enrichment: Selenium opens the `all-bids` portal (sort aligned when the UI exposes it), then for each bid navigates to the Bid Doc URL (same as following the Bid No document link), syncs cookies into `requests`, downloads the PDF, and extracts full text (with a Selenium fallback on the bid list page if needed).
-3. Pipeline 2: independent LLM relevance pass over PDF-backed bid content.
-4. Pipeline 3: independent inclusion-keyword extraction over full PDF text.
-5. Pipeline 4: merge Pipeline 2 and Pipeline 3 only, then dedupe by reference (no extra filtering here).
-6. Pipeline 5: final LLM categorization into `EXTRACTED` and `DOUBTFUL`; inclusion keywords can promote to `EXTRACTED`, exclusion hits downgrade to `DOUBTFUL` for review (nothing is dropped at this stage).
+3. Pipeline 2: Sonnet relevance pass over PDF-backed bid content (recall-oriented prefilter).
+4. Pipeline 3: hard inclusion keyword routing over Pipeline 2 output; any inclusion hit is forced to `EXTRACTED`.
+5. Pipeline 4: review remaining doubtful bids only; bids with exclusion hits are rejected immediately, and Sonnet classifies the rest into `EXTRACTED` or `DOUBTFUL` (with low-confidence doubtfuls rejected).
 7. Append-only Excel writes for extracted and doubtful rows.
 8. Queue-first Supabase sync so DB failure does not stop extraction.
 9. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
