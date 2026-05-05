@@ -294,10 +294,10 @@ class GemScraper:
                 logger.warning("GEM portal warm-up failed (continuing): %s", exc)
 
             for bid in bids:
-                bid_no = str(bid.get("Bid No.", "")).strip()
+                bid_no = str(bid.get("Bid No.", "")).strip() or str(bid.get("Reference No.", "")).strip()
                 bid_url = str(bid.get("Source URL", "")).strip()
                 bid_doc_url = str(bid.get("Bid Doc URL", "")).strip()
-                if not bid_no or not bid_url:
+                if not bid_no and not bid_doc_url:
                     skipped += 1
                     bid["PDF Text"] = ""
                     bid["PDF Path"] = ""
@@ -376,10 +376,8 @@ class GemScraper:
         end_date = end_dt.astimezone(timezone.utc).date()
         return min_date <= end_date <= max_date
 
-    def search_full(self, max_pages: int = MAX_PAGES_PER_PIPELINE) -> list[dict]:
+    def search_full(self, max_pages: int = MAX_PAGES_PER_PIPELINE, target_rows: int = 50) -> list[dict]:
         bids: list[dict] = []
-        seen_ids: set[str] = set()
-        ra_excluded = 0
         page = 1
         while page <= max_pages:
             data = self._search_page("", page)
@@ -388,24 +386,20 @@ class GemScraper:
                 break
 
             for doc in docs:
-                bid_id = str(_val(doc.get("b_id", "")))
-                if not bid_id or bid_id in seen_ids:
-                    continue
-                seen_ids.add(bid_id)
-                if not self._is_actionable_bid(doc):
-                    ra_excluded += 1
-                    continue
                 bid = self._parse_bid(doc, "")
                 bid["_pipeline"] = "full"
                 bids.append(bid)
+                if len(bids) >= target_rows:
+                    break
+            if len(bids) >= target_rows:
+                break
 
             page += 1
             time.sleep(random.uniform(*REQUEST_DELAY))
 
-        if page > max_pages:
+        if page > max_pages and len(bids) < target_rows:
             logger.warning("Pipeline full feed hit page cap (%d). Consider increasing MAX_PAGES_PER_PIPELINE.", max_pages)
-        logger.info("Excluded %d RA/non-actionable rows from full feed", ra_excluded)
-        logger.info("Fetched %d unique bids from full feed", len(bids))
+        logger.info("Fetched %d raw bids from first %d pages", len(bids), max_pages)
         return bids
 
     def search_keyword(self, keyword: str, cutoff: datetime, seen_ids: set[str]) -> list[dict]:

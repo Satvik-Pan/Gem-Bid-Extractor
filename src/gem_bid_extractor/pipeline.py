@@ -12,8 +12,9 @@ from .settings import (
     EXCLUSION_KEYWORDS,
     EXCEL_FILE,
     INCLUSION_KEYWORDS,
-    P4_DOUBTFUL_REJECT_BELOW,
-    P4_PREFILTER_MIN_CONFIDENCE,
+    P2_DOUBTFUL_MIN_CONFIDENCE,
+    P4_PROMOTE_EXTRACTED_MIN_CONFIDENCE,
+    P4_REJECT_BELOW_CONFIDENCE,
 )
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
@@ -48,17 +49,11 @@ def _flexible_phrase_pattern(term: str) -> re.Pattern[str]:
 
 
 def _patterns_for_keyword_term(term: str) -> list[re.Pattern[str]]:
-    """One or more regexes per keyword (e.g. 'fire wall' also tries 'firewall')."""
+    """Strict whole-phrase keyword matching."""
     tnorm = " ".join(term.strip().lower().split())
     if not tnorm:
         return [re.compile(r"$^")]
-    pats: list[re.Pattern[str]] = [_flexible_phrase_pattern(tnorm)]
-    parts = _tokenize_keyword_phrase(tnorm)
-    if len(parts) == 2:
-        joined = "".join(parts)
-        if len(joined) <= 32:
-            pats.append(_single_token_pattern(joined))
-    return pats
+    return [_flexible_phrase_pattern(tnorm)]
 
 
 def _compile_keyword_sets(terms: list[str]) -> list[tuple[str, list[re.Pattern[str]]]]:
@@ -123,40 +118,6 @@ def _match_keyword_set(pattern_set: list[tuple[str, list[re.Pattern[str]]]], hay
     return hits
 
 
-def _alnum_glue(haystack: str) -> str:
-    """Letters/digits only (Unicode-aware) — glued runs without spaces."""
-    return "".join(ch for ch in haystack.casefold() if ch.isalnum())
-
-
-def _latin_ascii_glue(haystack: str) -> str:
-    """
-    a-z and 0-9 only after casefold — helps when PDF mixes English with other scripts
-    so inclusion terms like 'ngfw' still match the Latin stream.
-    """
-    s = haystack.casefold()
-    return "".join(c for c in s if ("a" <= c <= "z") or c.isdigit())
-
-
-def _glued_substring_hits(
-    pattern_set: list[tuple[str, list[re.Pattern[str]]]], glue: str, already: list[str]
-) -> list[str]:
-    seen = set(already)
-    extra: list[str] = []
-    for label, _ in pattern_set:
-        if label in seen:
-            continue
-        parts = _tokenize_keyword_phrase(label)
-        if not parts:
-            continue
-        compact = "".join(parts)
-        if len(compact) < 3:
-            continue
-        if compact in glue:
-            extra.append(label)
-            seen.add(label)
-    return extra
-
-
 def _dedupe_by_ref(bids: list[dict]) -> list[dict]:
     seen: set[str] = set()
     out: list[dict] = []
@@ -195,30 +156,8 @@ def _merge_candidates(full_prefiltered: list[dict], keyword_bids: list[dict]) ->
 
 def _keyword_flags(bid: dict) -> tuple[bool, bool, list[str], list[str]]:
     haystack = _build_keyword_haystack(bid)
-    glue_u = _alnum_glue(haystack)
-    glue_a = _latin_ascii_glue(haystack)
     inclusion_hits = _match_keyword_set(_INCLUSION_PATTERN_SET, haystack)
-    for glue in (glue_u, glue_a):
-        if glue:
-            inclusion_hits.extend(_glued_substring_hits(_INCLUSION_PATTERN_SET, glue, inclusion_hits))
     exclusion_hits = _match_keyword_set(_EXCLUSION_PATTERN_SET, haystack)
-    for glue in (glue_u, glue_a):
-        if glue:
-            exclusion_hits.extend(_glued_substring_hits(_EXCLUSION_PATTERN_SET, glue, exclusion_hits))
-    # Dedupe while keeping order
-    def _dedupe_labels(xs: list[str]) -> list[str]:
-        seen: set[str] = set()
-        out: list[str] = []
-        for x in xs:
-            k = x.lower()
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(x)
-        return out
-
-    inclusion_hits = _dedupe_labels(inclusion_hits)
-    exclusion_hits = _dedupe_labels(exclusion_hits)
     has_inclusion = bool(inclusion_hits)
     has_exclusion = bool(exclusion_hits)
     return has_inclusion, has_exclusion, inclusion_hits, exclusion_hits
@@ -265,15 +204,15 @@ def run() -> dict:
     if not llm.enabled:
         raise RuntimeError("Anthropic classifier is disabled. Configure ANTHROPIC_API_KEY/ANTHROPIC_MODEL/ANTHROPIC_BASE_URL in .env")
 
-    logger.info("Pipeline 1/4: Fetching GEM bids (first 5 pages from all-bids)")
+    logger.info("Pipeline 1/4: Fetching exactly 50 bids from first 5 pages (all-bids)")
     scraper.init_session()
     try:
-        # Pipeline 1: fetch bids from first 5 pages only.
-        pipeline1_bids = scraper.search_full()
+        pipeline1_bids = scraper.search_full(max_pages=5, target_rows=50)
     finally:
         scraper.close()
 
-    pipeline1_new = [b for b in _dedupe_by_ref(pipeline1_bids) if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
+    # Keep raw order/count from first 5 pages; only skip already processed refs.
+    pipeline1_new = [b for b in pipeline1_bids if not tracker.is_processed(str(b.get("Reference No.", "")).strip())]
     pdf_stats = scraper.enrich_with_pdf_text(pipeline1_new)
     pipeline1_pdf_ready = [b for b in pipeline1_new if str(b.get("PDF Text", "")).strip()]
     logger.info("Pipeline 1/4 complete: %d new bids", len(pipeline1_new))
@@ -285,81 +224,78 @@ def run() -> dict:
         len(pipeline1_pdf_ready),
     )
 
-    # Pipeline 2: LLM relevance pass over Pipeline 1 output (recall-oriented).
-    logger.info("Pipeline 2/4: Running LLM relevance over Pipeline 1 output")
+    # Pipeline 2: LLM relevance over all PDF-backed bids.
+    # Routing:
+    # - inclusion keyword hit => EXTRACTED immediately
+    # - else YES / high-confidence => DOUBTFUL
+    # - else => REJECT
+    logger.info("Pipeline 2/4: Running Sonnet over all Pipeline1 PDF-backed bids")
     relevance_map = llm.prefilter(pipeline1_pdf_ready) if pipeline1_pdf_ready else {}
-    pipeline2_llm: list[dict] = []
+    pipeline2_extracted: list[dict] = []
+    pipeline2_doubtful: list[dict] = []
+    pipeline2_rejected = 0
     for bid in pipeline1_pdf_ready:
         ref = str(bid.get("Reference No.", "")).strip()
         decision = relevance_map.get(ref)
         if decision is None:
             decision = {"decision": "NO", "confidence": 0.15}
             logger.warning("Pipeline2 missing LLM decision for %s; defaulting to NO", ref)
-        conf = float(decision.get("confidence", 0.0))
-        keep = decision.get("decision") == "YES" or conf >= P4_PREFILTER_MIN_CONFIDENCE
-        if keep:
-            bid["Pipeline2 LLM Confidence"] = round(conf, 3)
-            pipeline2_llm.append(bid)
-    logger.info("Pipeline 2/4 complete: %d selected bids", len(pipeline2_llm))
-
-    # Pipeline 3: on Pipeline 2 output, force EXTRACTED when any inclusion keyword matches.
-    logger.info("Pipeline 3/4: Applying inclusion keyword force-extract over Pipeline 2 output")
-    pipeline3_forced_extracted: list[dict] = []
-    pipeline3_doubtful: list[dict] = []
-    for bid in pipeline2_llm:
+        conf = round(float(decision.get("confidence", 0.0) or 0.0), 3)
         has_inclusion, _, inclusion_hits, _ = _keyword_flags(bid)
         if has_inclusion:
-            bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
             bid["Final Category"] = "EXTRACTED"
-            bid["Pipeline Source"] = "pipeline3_inclusion_forced"
-            bid["LLM Confidence"] = round(float(bid.get("Pipeline2 LLM Confidence", 0.0) or 0.0), 3)
-            bid["LLM Reason"] = _build_reason(
-                "Pipeline3 inclusion rule: keyword hit forced EXTRACTED.",
-                inclusion_hits,
-                [],
-            )
-            pipeline3_forced_extracted.append(_sanitize_bid_strings(bid))
+            bid["Pipeline Source"] = "pipeline2_inclusion_forced"
+            bid["LLM Confidence"] = conf
+            bid["LLM Reason"] = _build_reason("Pipeline2 inclusion keyword hit -> EXTRACTED.", inclusion_hits, [])
+            bid["Inclusion Match"] = True
+            bid["Exclusion Match"] = False
+            bid["Inclusion Hits"] = ", ".join(inclusion_hits[:6])
+            bid["Exclusion Hits"] = ""
+            pipeline2_extracted.append(_sanitize_bid_strings(bid))
+            continue
+        if str(decision.get("decision", "")).upper() == "YES" or conf >= P2_DOUBTFUL_MIN_CONFIDENCE:
+            bid["Pipeline2 LLM Confidence"] = conf
+            pipeline2_doubtful.append(bid)
         else:
-            pipeline3_doubtful.append(bid)
+            pipeline2_rejected += 1
     logger.info(
-        "Pipeline 3/4 complete -> forced_extracted: %d, doubtful_to_pipeline4: %d",
-        len(pipeline3_forced_extracted),
-        len(pipeline3_doubtful),
+        "Pipeline 2/4 complete -> extracted: %d, doubtful: %d, rejected: %d",
+        len(pipeline2_extracted),
+        len(pipeline2_doubtful),
+        pipeline2_rejected,
     )
-    if not pipeline3_forced_extracted and pipeline2_llm:
-        sample = pipeline2_llm[0]
-        plen = len(str(sample.get("PDF Text", "")))
-        logger.warning(
-            "Pipeline 3 matched 0 bids; check PDF text (sample ref %s PDF chars=%d).",
-            str(sample.get("Reference No.", ""))[:40],
-            plen,
-        )
 
-    # Pipeline 4: re-evaluate only doubtful bids from Pipeline 3.
-    # - hard reject if any exclusion keyword is present
-    # - otherwise Sonnet can classify into EXTRACTED/DOUBTFUL
-    logger.info("Pipeline 4/4: Reviewing doubtful bids (exclusion hard-reject + Sonnet re-evaluation)")
-    pipeline4_exclusion_rejected = 0
-    pipeline4_reviewable: list[dict] = []
-    for bid in pipeline3_doubtful:
+    # Pipeline 3: exclusion keyword rejection over doubtful set from Pipeline 2.
+    logger.info("Pipeline 3/4: Applying strict exclusion keyword rejection over doubtful bids")
+    pipeline3_rejected = 0
+    pipeline3_doubtful: list[dict] = []
+    for bid in pipeline2_doubtful:
         _, has_exclusion, _, _ = _keyword_flags(bid)
         if has_exclusion:
-            pipeline4_exclusion_rejected += 1
+            pipeline3_rejected += 1
             continue
-        pipeline4_reviewable.append(bid)
+        pipeline3_doubtful.append(bid)
+    logger.info(
+        "Pipeline 3/4 complete -> rejected_by_exclusion: %d, doubtful_to_pipeline4: %d",
+        pipeline3_rejected,
+        len(pipeline3_doubtful),
+    )
 
-    final_map = llm.final_classify(pipeline4_reviewable) if pipeline4_reviewable else {}
-    final_coverage = (len(final_map) / len(pipeline4_reviewable)) if pipeline4_reviewable else 1.0
+    # Pipeline 4: Sonnet final review on remaining doubtful.
+    logger.info("Pipeline 4/4: Sonnet final review on remaining doubtful bids")
+    final_map = llm.final_classify(pipeline3_doubtful) if pipeline3_doubtful else {}
+    final_coverage = (len(final_map) / len(pipeline3_doubtful)) if pipeline3_doubtful else 1.0
 
-    relevant: list[dict] = list(pipeline3_forced_extracted)
+    relevant: list[dict] = list(pipeline2_extracted)
     doubtful: list[dict] = []
     ignored: list[dict] = []
     final_fallback_count = 0
-    pipeline4_llm_rejected = 0
+    pipeline4_promoted = 0
+    pipeline4_rejected = 0
 
-    selected_refs = {str(b.get("Reference No.", "")).strip() for b in [*pipeline3_forced_extracted, *pipeline4_reviewable]}
+    selected_refs = {str(b.get("Reference No.", "")).strip() for b in [*pipeline2_extracted, *pipeline3_doubtful]}
 
-    for bid in pipeline4_reviewable:
+    for bid in pipeline3_doubtful:
         ref = str(bid.get("Reference No.", "")).strip()
         final_vote = final_map.get(ref)
         if final_vote is None:
@@ -374,15 +310,25 @@ def run() -> dict:
         category = str(final_vote.get("category", "DOUBTFUL")).upper()
         confidence = round(float(final_vote.get("confidence", 0.0)), 3)
         reason = str(final_vote.get("reason", ""))
-        has_inclusion, _, inclusion_hits, exclusion_hits = _keyword_flags(bid)
+        has_inclusion, has_exclusion, inclusion_hits, exclusion_hits = _keyword_flags(bid)
 
         if category not in {"EXTRACTED", "DOUBTFUL"}:
             category = "DOUBTFUL"
             reason = f"{reason} | Final class normalized to DOUBTFUL.".strip(" |")
 
-        # Extra rejection gate inside Pipeline 4 for weak doubtfuls.
-        if category == "DOUBTFUL" and confidence < P4_DOUBTFUL_REJECT_BELOW and not has_inclusion:
-            pipeline4_llm_rejected += 1
+        # Safety: if exclusion appears here, reject regardless.
+        if has_exclusion:
+            pipeline4_rejected += 1
+            ignored.append(bid)
+            continue
+        if category == "EXTRACTED":
+            if confidence >= P4_PROMOTE_EXTRACTED_MIN_CONFIDENCE or has_inclusion:
+                pipeline4_promoted += 1
+            else:
+                category = "DOUBTFUL"
+                reason = f"{reason} | EXTRACTED confidence below promote threshold; kept as DOUBTFUL.".strip(" |")
+        elif confidence < P4_REJECT_BELOW_CONFIDENCE and not has_inclusion:
+            pipeline4_rejected += 1
             ignored.append(bid)
             continue
 
@@ -427,26 +373,27 @@ def run() -> dict:
     logger.info("LLM final coverage: %.2f", final_coverage)
     logger.info("LLM final fallback count: %d", final_fallback_count)
     logger.info(
-        "Pipeline 4 notes -> exclusion_rejected: %d, llm_rejected_low_confidence: %d",
-        pipeline4_exclusion_rejected,
-        pipeline4_llm_rejected,
+        "Pipeline 4 notes -> promoted_to_extracted: %d, rejected: %d",
+        pipeline4_promoted,
+        pipeline4_rejected,
     )
     logger.info("Pipeline 4/4 complete -> extracted: %d, doubtful: %d", len(relevant), len(doubtful))
     logger.info("Saved -> main: %d, doubtful: %d", added_main, added_doubtful)
 
     return {
-        "new": len(pipeline2_llm),
+        "new": len(pipeline1_new),
         "pipeline1_count": len(pipeline1_new),
         "pipeline1_pdf_ready": len(pipeline1_pdf_ready),
         "pdf_downloaded": pdf_stats["downloaded"],
         "pdf_failed": pdf_stats["failed"],
         "pdf_skipped": pdf_stats["skipped"],
-        "pipeline2_count": len(pipeline2_llm),
-        "pipeline3_extracted": len(pipeline3_forced_extracted),
+        "pipeline2_extracted": len(pipeline2_extracted),
         "pipeline3_doubtful": len(pipeline3_doubtful),
-        "pipeline4_reviewed": len(pipeline4_reviewable),
-        "pipeline4_exclusion_rejected": pipeline4_exclusion_rejected,
-        "pipeline4_llm_rejected": pipeline4_llm_rejected,
+        "pipeline2_rejected": pipeline2_rejected,
+        "pipeline3_rejected": pipeline3_rejected,
+        "pipeline4_reviewed": len(pipeline3_doubtful),
+        "pipeline4_promoted": pipeline4_promoted,
+        "pipeline4_rejected": pipeline4_rejected,
         "relevant": len(relevant),
         "doubtful": len(doubtful),
         "saved_main": added_main,

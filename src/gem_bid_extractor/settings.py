@@ -116,10 +116,12 @@ SESSION_REFRESH_EVERY = 100
 PDF_FETCH_TIMEOUT_SECONDS = int(os.environ.get("PDF_FETCH_TIMEOUT_SECONDS", "25"))
 PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
 SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
-# Pipeline 2 keep-gate (recall-oriented): allow YES decisions and mid-confidence possible cyber bids.
-P4_PREFILTER_MIN_CONFIDENCE = float(os.environ.get("P4_PREFILTER_MIN_CONFIDENCE", "0.35"))
-# Pipeline 4 reject-gate for doubtful bids with weak confidence and no inclusion signal.
-P4_DOUBTFUL_REJECT_BELOW = float(os.environ.get("P4_DOUBTFUL_REJECT_BELOW", "0.20"))
+# Pipeline 2: bid is kept in doubtful (if not inclusion hit) when Sonnet confidence is at least this.
+P2_DOUBTFUL_MIN_CONFIDENCE = float(os.environ.get("P2_DOUBTFUL_MIN_CONFIDENCE", "0.35"))
+# Pipeline 4: promote doubtful bid to EXTRACTED when Sonnet returns EXTRACTED with at least this confidence.
+P4_PROMOTE_EXTRACTED_MIN_CONFIDENCE = float(os.environ.get("P4_PROMOTE_EXTRACTED_MIN_CONFIDENCE", "0.70"))
+# Pipeline 4: reject doubtful bid when Sonnet marks DOUBTFUL with confidence below this.
+P4_REJECT_BELOW_CONFIDENCE = float(os.environ.get("P4_REJECT_BELOW_CONFIDENCE", "0.20"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")

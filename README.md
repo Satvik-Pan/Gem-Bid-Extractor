@@ -4,11 +4,11 @@ Cybersecurity bid extractor with a 4-stage pipeline, strict Anthropic classifica
 
 ## Architecture
 
-1. Pipeline 1: fetch GEM bids from the first 5 pages of `all-bids` with `Bid-Start-Date-Latest`, keep actionable `Bid No` entries, and exclude RA/non-actionable rows.
+1. Pipeline 1: fetch exactly 50 raw GEM bids from the first 5 pages of `all-bids` with `Bid-Start-Date-Latest`.
 2. Pipeline 1 enrichment: Selenium opens the `all-bids` portal (sort aligned when the UI exposes it), then for each bid navigates to the Bid Doc URL (same as following the Bid No document link), syncs cookies into `requests`, downloads the PDF, and extracts full text (with a Selenium fallback on the bid list page if needed).
-3. Pipeline 2: Sonnet relevance pass over PDF-backed bid content (recall-oriented prefilter).
-4. Pipeline 3: hard inclusion keyword routing over Pipeline 2 output; any inclusion hit is forced to `EXTRACTED`.
-5. Pipeline 4: review remaining doubtful bids only; bids with exclusion hits are rejected immediately, and Sonnet classifies the rest into `EXTRACTED` or `DOUBTFUL` (with low-confidence doubtfuls rejected).
+3. Pipeline 2: Sonnet deep relevance pass over PDF-backed bids; any inclusion keyword hit is immediately forced to `EXTRACTED`, otherwise Sonnet routes to doubtful or reject.
+4. Pipeline 3: strict whole-phrase exclusion keyword rejection on doubtful candidates from Pipeline 2.
+5. Pipeline 4: Sonnet reviews remaining doubtful bids and classifies them into `EXTRACTED` / `DOUBTFUL` / rejected (via confidence gate).
 7. Append-only Excel writes for extracted and doubtful rows.
 8. Queue-first Supabase sync so DB failure does not stop extraction.
 9. Dashboard reads the shared worklist and supports Tick and Cross actions for extracted and doubtful queues.
