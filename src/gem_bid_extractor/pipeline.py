@@ -4,13 +4,15 @@ import logging
 import re
 import unicodedata
 
+from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
 from .gem_client import GemScraper
 from .settings import (
     DOUBTFUL_FILE,
-    EXCLUSION_KEYWORDS,
     EXCEL_FILE,
     INCLUSION_KEYWORDS,
+    LLM_DOUBTFUL_MIN_CONFIDENCE,
+    LLM_EXTRACT_MIN_CONFIDENCE,
 )
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
@@ -102,16 +104,26 @@ def _sanitize_bid(bid: dict) -> dict:
     return bid
 
 
+def _dedupe_bids_by_identity(bids: list[dict]) -> list[dict]:
+    deduped: dict[str, dict] = {}
+    for bid in bids:
+        bid_id = str(bid.get("Bid ID", "")).strip()
+        ref = str(bid.get("Reference No.", "")).strip()
+        doc_url = str(bid.get("Bid Doc URL", "")).strip()
+        key = bid_id or ref or doc_url
+        if not key:
+            continue
+        deduped[key] = bid
+    return list(deduped.values())
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run() -> dict:
-    # Compile keyword patterns
-    inclusion_patterns = _compile_keyword_sets(INCLUSION_KEYWORDS)
-    exclusion_patterns = _compile_keyword_sets(EXCLUSION_KEYWORDS)
-
     scraper = GemScraper()
+    llm = AnthropicClaudeClassifier()
     tracker = BidTracker()
     db = SupabaseStore()
     writer_main = ExcelWriter(EXCEL_FILE)
@@ -142,6 +154,7 @@ def run() -> dict:
         b for b in pipeline1_bids
         if not tracker.is_processed(str(b.get("Reference No.", "")).strip())
     ]
+    pipeline1_new = _dedupe_bids_by_identity(pipeline1_new)
     logger.info(
         "Pipeline 1 complete: %d total bids, %d new (not previously processed)",
         len(pipeline1_bids), len(pipeline1_new),
@@ -170,61 +183,122 @@ def run() -> dict:
         pdf_stats["downloaded"], pdf_stats["failed"], pdf_stats["skipped"],
         len(pipeline1_with_pdf), len(pipeline1_no_pdf),
     )
+    logger.info(
+        "Pipeline 1 PDF details: file_saved=%d, text_extracted=%d, text_empty=%d, link_not_found=%d, "
+        "not_pdf_payload=%d, reused=%d",
+        pdf_stats.get("pdf_file_saved", 0),
+        pdf_stats.get("pdf_text_extracted", 0),
+        pdf_stats.get("pdf_extraction_empty", 0),
+        pdf_stats.get("pdf_link_not_found", 0),
+        pdf_stats.get("pdf_not_pdf_payload", 0),
+        pdf_stats.get("pdf_reused", 0),
+    )
+
+    if pipeline1_no_pdf:
+        refs = ", ".join(str(b.get("Reference No.", "")).strip() for b in pipeline1_no_pdf[:10])
+        logger.warning(
+            "Pipeline 1 PDF retrieval incomplete for %d bids (sample refs: %s)",
+            len(pipeline1_no_pdf), refs,
+        )
 
     # ==================================================================
-    # PIPELINE 2: Analyze bid document PDFs for exclusion keywords
-    #   - Check each PDF for exclusion keywords
-    #   - No exclusion keywords found -> EXTRACTED
-    #   - Exclusion + inclusion keywords both found -> DOUBTFUL
-    #   - Only exclusion keywords (no inclusion in PDF) -> REJECT
+    # PIPELINE 2: LLM deep analysis on every PDF-backed bid
     # ==================================================================
     logger.info("=" * 70)
-    logger.info("PIPELINE 2: PDF analysis for exclusion keywords")
+    logger.info("PIPELINE 2: LLM deep analysis (exact keyword + confidence)")
     logger.info("=" * 70)
 
     extracted: list[dict] = []
     doubtful: list[dict] = []
     rejected: list[dict] = []
 
+    if not llm.enabled:
+        raise RuntimeError("Anthropic classifier not configured; Pipeline 2 requires Sonnet.")
+
     for i, bid in enumerate(pipeline1_with_pdf, 1):
         ref = str(bid.get("Reference No.", "")).strip()
-        haystack = _build_haystack(bid)
-
-        exclusion_hits = _find_keyword_hits(exclusion_patterns, haystack)
-        inclusion_hits = _find_keyword_hits(inclusion_patterns, haystack)
-
-        if not exclusion_hits:
-            # No exclusion keywords -> EXTRACTED
-            bid["Final Category"] = "EXTRACTED"
-            bid["Pipeline Source"] = "pipeline2_extracted"
-            bid["Inclusion Hits"] = ", ".join(inclusion_hits[:8])
-            bid["Exclusion Hits"] = ""
-            extracted.append(_sanitize_bid(bid))
-            logger.info(
-                "Pipeline 2: [%d/%d] EXTRACTED - %s (inclusion: %s)",
-                i, len(pipeline1_with_pdf), ref,
-                ", ".join(inclusion_hits[:3]) or "search-matched",
+        analysis = llm.classify_bid(bid)
+        inclusion_hits = analysis["inclusion_hits"]
+        exclusion_hits = analysis["exclusion_hits"]
+        confidence = float(analysis["confidence"])
+        selected_keyword = str(analysis["selected_inclusion_keyword"]).strip()
+        if selected_keyword and selected_keyword not in inclusion_hits:
+            inclusion_hits = [selected_keyword, *inclusion_hits]
+        if not selected_keyword:
+            selected_keyword = (
+                inclusion_hits[0]
+                if inclusion_hits
+                else str(bid.get("Search Keyword", "")).strip()
             )
-        elif exclusion_hits and inclusion_hits:
-            # Both exclusion AND inclusion -> DOUBTFUL
+
+        bid["LLM Confidence"] = round(confidence, 3)
+        bid["Inclusion Hits"] = ", ".join(inclusion_hits[:8])
+        bid["Exclusion Hits"] = ", ".join(exclusion_hits[:8])
+
+        if not inclusion_hits:
+            bid["Pipeline Source"] = "pipeline2_reject_no_inclusion"
+            bid["LLM Reason"] = f"Rejected: exact inclusion phrase not found in PDF. {analysis['reason']}".strip()
+            rejected.append(_sanitize_bid(bid))
+            logger.info(
+                "Pipeline 2: [%d/%d] REJECTED - %s (no exact inclusion phrase; conf=%.3f)",
+                i, len(pipeline1_with_pdf), ref, confidence,
+            )
+            continue
+
+        if exclusion_hits:
+            # inclusion+exclusion => doubtful
             bid["Final Category"] = "DOUBTFUL"
-            bid["Pipeline Source"] = "pipeline2_doubtful_both"
-            bid["Inclusion Hits"] = ", ".join(inclusion_hits[:8])
-            bid["Exclusion Hits"] = ", ".join(exclusion_hits[:8])
+            bid["Pipeline Source"] = "pipeline2_doubtful_inclusion_exclusion"
+            bid["LLM Reason"] = (
+                f"Selected by keyword: {selected_keyword}; "
+                f"Exclusion phrase(s) also found: {', '.join(exclusion_hits[:3])}. {analysis['reason']}"
+            ).strip()
             doubtful.append(_sanitize_bid(bid))
             logger.info(
-                "Pipeline 2: [%d/%d] DOUBTFUL - %s (has both: incl=%s, excl=%s)",
+                "Pipeline 2: [%d/%d] DOUBTFUL - %s (incl=%s, excl=%s, conf=%.3f)",
                 i, len(pipeline1_with_pdf), ref,
-                ", ".join(inclusion_hits[:3]),
-                ", ".join(exclusion_hits[:3]),
+                ", ".join(inclusion_hits[:2]),
+                ", ".join(exclusion_hits[:2]),
+                confidence,
+            )
+            continue
+
+        if confidence >= LLM_EXTRACT_MIN_CONFIDENCE:
+            bid["Final Category"] = "EXTRACTED"
+            bid["Pipeline Source"] = "pipeline2_extracted"
+            bid["LLM Reason"] = f"Selected by keyword: {selected_keyword}. {analysis['reason']}".strip()
+            extracted.append(_sanitize_bid(bid))
+            logger.info(
+                "Pipeline 2: [%d/%d] EXTRACTED - %s (inclusion=%s, conf=%.3f)",
+                i, len(pipeline1_with_pdf), ref,
+                selected_keyword or "search-matched",
+                confidence,
+            )
+        elif confidence >= LLM_DOUBTFUL_MIN_CONFIDENCE:
+            bid["Final Category"] = "DOUBTFUL"
+            bid["Pipeline Source"] = "pipeline2_doubtful_low_confidence"
+            bid["LLM Reason"] = (
+                f"Selected by keyword: {selected_keyword}; "
+                f"Needs review due to lower confidence ({confidence:.3f}). {analysis['reason']}"
+            ).strip()
+            doubtful.append(_sanitize_bid(bid))
+            logger.info(
+                "Pipeline 2: [%d/%d] DOUBTFUL - %s (inclusion=%s, conf=%.3f)",
+                i, len(pipeline1_with_pdf), ref,
+                selected_keyword or "search-matched",
+                confidence,
             )
         else:
-            # Only exclusion keywords, no inclusion -> REJECT
-            rejected.append(bid)
+            bid["Pipeline Source"] = "pipeline2_reject_low_confidence"
+            bid["LLM Reason"] = (
+                f"Rejected: low cybersecurity relevance confidence ({confidence:.3f}). "
+                f"Selected keyword: {selected_keyword}. {analysis['reason']}"
+            ).strip()
+            rejected.append(_sanitize_bid(bid))
             logger.info(
-                "Pipeline 2: [%d/%d] REJECTED - %s (exclusion only: %s)",
+                "Pipeline 2: [%d/%d] REJECTED - %s (low confidence %.3f)",
                 i, len(pipeline1_with_pdf), ref,
-                ", ".join(exclusion_hits[:3]),
+                confidence,
             )
 
     logger.info(
@@ -250,9 +324,11 @@ def run() -> dict:
 
     # Mark everything in tracker
     for bid in extracted:
-        tracker.mark(bid.get("Reference No.", ""), "extracted", 100, 1.0)
+        conf = float(bid.get("LLM Confidence", 1.0) or 1.0)
+        tracker.mark(bid.get("Reference No.", ""), "extracted", int(conf * 100), conf)
     for bid in doubtful:
-        tracker.mark(bid.get("Reference No.", ""), "doubtful", 60, 0.5)
+        conf = float(bid.get("LLM Confidence", 0.5) or 0.5)
+        tracker.mark(bid.get("Reference No.", ""), "doubtful", int(conf * 100), conf)
     for bid in rejected:
         tracker.mark(bid.get("Reference No.", ""), "rejected_exclusion", 0, 0)
     for bid in pipeline1_no_pdf:
@@ -275,6 +351,12 @@ def run() -> dict:
         "pipeline1_no_pdf": len(pipeline1_no_pdf),
         "pdf_downloaded": pdf_stats["downloaded"],
         "pdf_failed": pdf_stats["failed"],
+        "pdf_file_saved": pdf_stats.get("pdf_file_saved", 0),
+        "pdf_text_extracted": pdf_stats.get("pdf_text_extracted", 0),
+        "pdf_text_empty": pdf_stats.get("pdf_extraction_empty", 0),
+        "pdf_link_not_found": pdf_stats.get("pdf_link_not_found", 0),
+        "pdf_not_pdf_payload": pdf_stats.get("pdf_not_pdf_payload", 0),
+        "pdf_reused": pdf_stats.get("pdf_reused", 0),
         "pipeline2_extracted": len(extracted),
         "pipeline2_doubtful": len(doubtful),
         "pipeline2_rejected": len(rejected),

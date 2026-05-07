@@ -22,9 +22,12 @@ EXCEL_FILE = OUTPUT_DIR / "Extracted_bids.xlsx"
 DOUBTFUL_FILE = OUTPUT_DIR / "doubtful_bids.xlsx"
 PROCESSED_FILE = DATA_DIR / "processed_bids.json"
 LOG_FILE = LOG_DIR / "scraper.log"
+RUN_LOG_DIR = LOG_DIR / "runs"
 RUN_STATUS_FILE = DATA_DIR / "last_run_status.json"
 SYNC_QUEUE_FILE = DATA_DIR / "db_sync_queue.jsonl"
 DNS_CACHE_FILE = DATA_DIR / "dns_cache.json"
+RUN_LOCK_FILE = DATA_DIR / "extractor.lock"
+PDF_INDEX_FILE = DATA_DIR / "pdf_index.json"
 
 KEYWORDS_FILE = BASE_DIR / "src" / "gem_bid_extractor" / "keywords.csv"
 
@@ -146,3 +149,7 @@ DB_NAME = os.environ.get("SUPABASE_DB_NAME", "postgres")
 DB_USER = os.environ.get("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.environ.get("SUPABASE_DB_PASSWORD", "")
 DB_SSLMODE = os.environ.get("SUPABASE_DB_SSLMODE", "require")
+
+# Pipeline 2 LLM routing thresholds
+LLM_EXTRACT_MIN_CONFIDENCE = float(os.environ.get("LLM_EXTRACT_MIN_CONFIDENCE", "0.65"))
+LLM_DOUBTFUL_MIN_CONFIDENCE = float(os.environ.get("LLM_DOUBTFUL_MIN_CONFIDENCE", "0.40"))

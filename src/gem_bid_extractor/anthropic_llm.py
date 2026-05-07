@@ -18,72 +18,101 @@ from .settings import (
 )
 
 # ---------------------------------------------------------------------------
-# Pipeline 2 prompt: Deep PDF analysis for INCLUSION keyword detection
+# Pipeline 2 prompt: strict inclusion/exclusion and confidence classification
 # ---------------------------------------------------------------------------
-_PIPELINE2_INCLUSION_PROMPT = """You are a cybersecurity bid analyst. You are given the FULL text extracted from a government bid document PDF.
+_PIPELINE2_CLASSIFIER_PROMPT = """You are a strict cybersecurity bid analyst.
 
-Your task: Deeply analyze the ENTIRE document and determine if ANY of the following INCLUSION keywords appear in the bid document, either explicitly or as part of the bid's technical requirements/scope.
+You must deeply review the FULL bid PDF text and return strict JSON only.
 
-INCLUSION KEYWORDS:
-- Router
-- NGFW
-- FIREWALL
-- FIRE WALL
-- VPN
-- UTM
-- Next Generation Firewall
-- UNIFIED Threat Manager
-- Network Security
-- Web Application Firewall
-- WAF
+INCLUSION KEYWORDS (exact phrase intent, case-insensitive):
+Router
+NGFW
+FIREWALL
+FIRE WALL
+VPN
+UTM
+Next Generation Firewall
+UNIFIED Threat Manager
+Network Security
+Web Application Firewall
+WAF
 
-RULES:
-1. Search the ENTIRE document text thoroughly — headers, scope, BOQ, technical specs, everything.
-2. If you find ANY of these keywords (even one), the bid is RELEVANT.
-3. Match case-insensitively. "firewall", "Firewall", "FIREWALL" all count.
-4. "Next Generation Firewall" and "NGFW" are the same concept — either counts.
-5. Return strict JSON only. No explanations outside the JSON.
+EXCLUSION KEYWORDS (exact phrase intent, case-insensitive):
+IPS
+Load Balancer
+NextGen
+Next
+UNIFIED
+SDWAN
+SD WAN
+Software Define WAN
+DNS
+Intrusion
+LLB
+SLB
+Web Security
+Threat
+Internet
+Gateway
+Perimeter
+Endpoint
+EPS
+Malware
+Ransomware
+IPSec
+Edge
+Cyber Security
+Virus
+AAA
+Firepower
+ASA
+Bandwidth
+Renewal
+Authentication
+LAN
+Armynet
+Domain
+Anti-APT
+Anti-ATP
+Sophos
+Gajshield
+Checkpoint
+Anexgate
+Tacitine
+Fortinet
+Fortigate
+PaloAlto
+Quickheal
+Forcepoint
+CISCO
+Juniper
+Sonicwall
+TrendMicro
+Mcafee
+Radware
+Array Networks
+Haltdos
+DDoS
+Trellix
+Data Loss Prevention
+Scada/ Scada Firewall
 
-Return:
-{"ref": "<Reference No.>", "found": true|false, "matched_keywords": ["keyword1", "keyword2"], "reason": "brief explanation"}
+Rules:
+1) Assess the FULL text for exact phrase intent matches. Avoid false positives like "fire ball" or "fire extinguisher" for FIRE WALL/FIREWALL.
+2) Provide cybersecurity relevance confidence from 0.0 to 1.0.
+3) Confidence should be very low for non-cyber tenders (fire safety hardware, civil, furniture, etc).
+4) Always return valid JSON with all fields below.
 
-- found=true if ANY inclusion keyword was found in the document.
-- found=false if NONE of the inclusion keywords were found.
-- matched_keywords: list of specific keywords found (empty if none).
-"""
-
-# ---------------------------------------------------------------------------
-# Pipeline 3 prompt: Deep PDF analysis for EXCLUSION keyword detection
-# (This is done via regex in the pipeline, but we keep a prompt ready
-#  in case LLM-based exclusion is needed in the future.)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Pipeline 4 prompt: Final confidence scoring for cybersecurity relevance
-# ---------------------------------------------------------------------------
-_PIPELINE4_CONFIDENCE_PROMPT = """You are a cybersecurity bid relevance analyst for a network security company (WiJungle) that sells products like firewalls, NGFW, UTM, VPN appliances, WAF, and routers.
-
-You are given the FULL text extracted from a government bid document PDF. This bid has already passed initial keyword screening — it did NOT contain direct product keywords but also did NOT contain any disqualifying exclusion keywords.
-
-Your task: Deeply analyze the ENTIRE document and determine if this bid is potentially relevant to a cybersecurity/network security company.
-
-SCORING GUIDE:
-- 0.80-1.00: Clearly relevant to cybersecurity/network security even without direct keywords (e.g., security infrastructure, IT security procurement, network appliance procurement)
-- 0.50-0.79: Moderately relevant — has IT/networking components that could involve security products
-- 0.25-0.49: Weakly relevant — tangential connection to IT/networking, could possibly need security products
-- 0.00-0.24: Not relevant — clearly about non-cyber topics (construction, furniture, food, medical, vehicles, stationery, plumbing, cleaning, etc.)
-
-RULES:
-1. Read the ENTIRE document carefully.
-2. Consider the procurement scope, technical specifications, and department context.
-3. Be STRICT: if the bid is about physical goods, construction, or services clearly unrelated to cybersecurity, give a very low score (under 0.20).
-4. Return strict JSON only.
-
-Return:
-{"ref": "<Reference No.>", "confidence": 0.00, "relevant": true|false, "reason": "brief explanation of why this score was given"}
-
-- relevant=true if confidence >= 0.25 (these go to DOUBTFUL column)
-- relevant=false if confidence < 0.25 (these are REJECTED)
+Return format:
+{
+  "ref": "<Reference No.>",
+  "inclusion_hits": ["..."],
+  "exclusion_hits": ["..."],
+  "selected_inclusion_keyword": "<exact keyword from list or empty>",
+  "confidence": 0.0,
+  "is_cybersecurity_relevant": true,
+  "reason": "short decision rationale"
+}
 """
 
 logger = logging.getLogger(__name__)
@@ -244,72 +273,40 @@ class AnthropicClaudeClassifier:
             raise RuntimeError(f"Anthropic API call failed after retries: {last_exc}") from last_exc
         raise RuntimeError("Anthropic API call failed after retries")
 
-    # ------------------------------------------------------------------
-    # Pipeline 2: Check ONE bid's PDF for inclusion keywords via LLM
-    # ------------------------------------------------------------------
-    def check_inclusion_keywords(self, bid: dict) -> dict:
-        """Analyze a single bid's PDF text for inclusion keywords.
-
-        Returns:
-            {"found": bool, "matched_keywords": [...], "reason": "..."}
-        """
+    def classify_bid(self, bid: dict) -> dict:
+        """Deeply classify one bid PDF using strict keyword + relevance analysis."""
         ref = self._safe_snippet(bid.get("Reference No.", ""), 120)
-        pdf_text = self._safe_snippet(bid.get("PDF Text", ""), 50000)  # Send substantial PDF content
+        pdf_text = self._safe_snippet(bid.get("PDF Text", ""), 110000)
         name = self._safe_snippet(bid.get("Name", ""), 500)
         category = self._safe_snippet(bid.get("Category", ""), 200)
         department = self._safe_snippet(bid.get("Department", ""), 300)
+        search_kw = self._safe_snippet(bid.get("Search Keyword", ""), 100)
 
         user_content = (
             f"Reference No.: {ref}\n"
             f"Title: {name}\n"
             f"Category: {category}\n"
             f"Department: {department}\n\n"
+            f"Pipeline-1 Search Keyword: {search_kw}\n\n"
             f"=== FULL BID DOCUMENT TEXT ===\n{pdf_text}"
         )
 
-        result = self._call_api(_PIPELINE2_INCLUSION_PROMPT, user_content, max_tokens=800)
-
-        return {
-            "found": bool(result.get("found", False)),
-            "matched_keywords": result.get("matched_keywords", []),
-            "reason": str(result.get("reason", ""))[:500],
-        }
-
-    # ------------------------------------------------------------------
-    # Pipeline 4: Score ONE bid's PDF for cybersecurity relevance
-    # ------------------------------------------------------------------
-    def score_relevance(self, bid: dict) -> dict:
-        """Analyze a single bid's PDF text and score its cybersecurity relevance.
-
-        Returns:
-            {"confidence": float, "relevant": bool, "reason": "..."}
-        """
-        ref = self._safe_snippet(bid.get("Reference No.", ""), 120)
-        pdf_text = self._safe_snippet(bid.get("PDF Text", ""), 50000)  # Send substantial PDF content
-        name = self._safe_snippet(bid.get("Name", ""), 500)
-        category = self._safe_snippet(bid.get("Category", ""), 200)
-        department = self._safe_snippet(bid.get("Department", ""), 300)
-        desc = self._safe_snippet(bid.get("Description", ""), 300)
-
-        user_content = (
-            f"Reference No.: {ref}\n"
-            f"Title: {name}\n"
-            f"Category: {category}\n"
-            f"Department: {department}\n"
-            f"Description: {desc}\n\n"
-            f"=== FULL BID DOCUMENT TEXT ===\n{pdf_text}"
-        )
-
-        result = self._call_api(_PIPELINE4_CONFIDENCE_PROMPT, user_content, max_tokens=800)
-
+        result = self._call_api(_PIPELINE2_CLASSIFIER_PROMPT, user_content, max_tokens=1200)
+        inclusion_hits_raw = result.get("inclusion_hits", [])
+        exclusion_hits_raw = result.get("exclusion_hits", [])
+        inclusion_hits = [str(x).strip() for x in inclusion_hits_raw if str(x).strip()] if isinstance(inclusion_hits_raw, list) else []
+        exclusion_hits = [str(x).strip() for x in exclusion_hits_raw if str(x).strip()] if isinstance(exclusion_hits_raw, list) else []
+        selected = str(result.get("selected_inclusion_keyword", "")).strip()
         try:
-            conf = float(result.get("confidence", 0.0))
+            confidence = float(result.get("confidence", 0.0))
         except (TypeError, ValueError):
-            conf = 0.0
-        conf = max(0.0, min(1.0, conf))
-
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
         return {
-            "confidence": round(conf, 3),
-            "relevant": bool(result.get("relevant", conf >= 0.25)),
+            "inclusion_hits": inclusion_hits,
+            "exclusion_hits": exclusion_hits,
+            "selected_inclusion_keyword": selected,
+            "confidence": round(confidence, 3),
+            "is_cybersecurity_relevant": bool(result.get("is_cybersecurity_relevant", confidence >= 0.5)),
             "reason": str(result.get("reason", ""))[:500],
         }

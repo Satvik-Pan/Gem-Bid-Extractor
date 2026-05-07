@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -26,6 +27,7 @@ from .settings import (
     MAX_PAGES_PER_KEYWORD,
     MAX_RETRIES,
     PDF_CACHE_DIR,
+    PDF_INDEX_FILE,
     PDF_FETCH_RETRIES,
     PDF_FETCH_TIMEOUT_SECONDS,
     REQUEST_DELAY,
@@ -196,12 +198,36 @@ class GemScraper:
         options = Options()
         if SELENIUM_HEADLESS:
             options.add_argument("--headless=new")
+        # Keep browser-managed downloads inside project cache folder.
+        PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        prefs = {
+            "download.default_directory": str(PDF_CACHE_DIR.resolve()),
+            "download.prompt_for_download": False,
+            "download.directory_upgrade": True,
+            "plugins.always_open_pdf_externally": True,
+        }
+        options.add_experimental_option("prefs", prefs)
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1400,1600")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
         return webdriver.Chrome(options=options)
+
+    @staticmethod
+    def _load_pdf_index() -> dict[str, dict]:
+        if not PDF_INDEX_FILE.exists():
+            return {}
+        try:
+            data = json.loads(PDF_INDEX_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _save_pdf_index(index: dict[str, dict]) -> None:
+        PDF_INDEX_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PDF_INDEX_FILE.write_text(json.dumps(index, ensure_ascii=True, indent=2), encoding="utf-8")
 
     def _extract_pdf_link(self, driver: webdriver.Chrome, bid_url: str) -> str:
         driver.get(bid_url)
@@ -230,6 +256,51 @@ class GemScraper:
                 continue
             return link
         return ""
+
+    @staticmethod
+    def _extract_pdf_link_from_html(html: str, base_url: str) -> str:
+        if not html:
+            return ""
+        patterns = [
+            r"https?://[^\"']+\.pdf(?:\?[^\"']*)?",
+            r"/[^\"']+\.pdf(?:\?[^\"']*)?",
+            r"https?://[^\"']*download[^\"']*",
+            r"/[^\"']*download[^\"']*",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, html, flags=re.IGNORECASE):
+                link = match.group(0).strip()
+                if link.startswith("/"):
+                    link = urljoin(base_url, link)
+                low = link.lower()
+                if "handbook" in low or "assets-bg.gem.gov.in/resources/pdf" in low:
+                    continue
+                return link
+        return ""
+
+    @staticmethod
+    def _snapshot_pdf_files() -> set[str]:
+        PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        return {p.name for p in PDF_CACHE_DIR.glob("*.pdf")}
+
+    @staticmethod
+    def _await_new_download(before: set[str], timeout_seconds: int = 10) -> Path | None:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            current = sorted(PDF_CACHE_DIR.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for path in current:
+                if path.name in before:
+                    continue
+                if path.stat().st_size <= 80:
+                    continue
+                # Wait for file size to stabilize.
+                size1 = path.stat().st_size
+                time.sleep(0.35)
+                size2 = path.stat().st_size
+                if size2 >= size1 and size2 > 80:
+                    return path
+            time.sleep(0.35)
+        return None
 
     def _sync_session_cookies_from_driver(self, driver: webdriver.Chrome) -> None:
         """Copy browser cookies into the requests session."""
@@ -266,7 +337,8 @@ class GemScraper:
         if not pdf_url:
             return None
         PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        safe_name = self._sanitize_filename(bid_no) or f"bid_{int(time.time())}"
+        digest = hashlib.sha1(pdf_url.encode("utf-8")).hexdigest()[:12]
+        safe_name = self._sanitize_filename(f"{bid_no}_{digest}") or f"bid_{int(time.time())}"
         out_path = PDF_CACHE_DIR / f"{safe_name}.pdf"
         # Skip if already cached
         if out_path.exists() and out_path.stat().st_size > 80:
@@ -274,11 +346,49 @@ class GemScraper:
         try:
             resp = self.session.get(pdf_url, timeout=PDF_FETCH_TIMEOUT_SECONDS, verify=False)
             resp.raise_for_status()
-            out_path.write_bytes(resp.content)
-            return out_path if out_path.exists() and out_path.stat().st_size > 0 else None
+            content = resp.content or b""
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            head = content[:2048].lstrip().lower()
+            looks_like_html = head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<body" in head
+            likely_pdf = (
+                b"%pdf" in content[:2048].lower()
+                or "application/pdf" in ctype
+                or "application/octet-stream" in ctype
+                or pdf_url.lower().endswith(".pdf")
+            )
+            if looks_like_html and not likely_pdf:
+                return None
+            out_path.write_bytes(content)
+            return out_path if out_path.exists() and out_path.stat().st_size > 80 else None
         except requests.RequestException as exc:
             logger.warning("PDF download failed for %s (%s): %s", bid_no, pdf_url, exc)
             return None
+
+    def _normalize_downloaded_pdf(self, source_path: Path, bid_no: str, bid_key: str) -> Path:
+        PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        key = bid_key or bid_no or str(int(time.time()))
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+        safe_name = self._sanitize_filename(f"{bid_no}_{digest}") or f"bid_{digest}"
+        target = PDF_CACHE_DIR / f"{safe_name}.pdf"
+        if source_path.resolve() == target.resolve():
+            return target
+        if target.exists() and target.stat().st_size > 80:
+            return target
+        try:
+            source_path.replace(target)
+        except OSError:
+            # Cross-device or locked file fallback.
+            target.write_bytes(source_path.read_bytes())
+        return target
+
+    @staticmethod
+    def _has_pdf_magic(path: Path) -> bool:
+        try:
+            with path.open("rb") as fh:
+                head = fh.read(8)
+            return head.startswith(b"%PDF")
+        except OSError:
+            return False
 
     # ------------------------------------------------------------------
     # Pipeline 1: Search each inclusion keyword, filter by start date
@@ -287,15 +397,15 @@ class GemScraper:
         self,
         keyword: str,
         lookback_days: int = LOOKBACK_DAYS,
-        seen_refs: set[str] | None = None,
+        seen_keys: set[str] | None = None,
     ) -> list[dict]:
         """Search GEM for a single keyword, return bids with start date >= cutoff.
 
         Paginates until start dates fall before cutoff or safety cap hit.
-        Skips refs already in seen_refs (cross-keyword dedup).
+        Skips bids already in seen_keys (cross-keyword dedup).
         """
-        if seen_refs is None:
-            seen_refs = set()
+        if seen_keys is None:
+            seen_keys = set()
 
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).date()
         bids: list[dict] = []
@@ -311,7 +421,11 @@ class GemScraper:
             for doc in docs:
                 bid = self._parse_bid(doc, keyword)
                 ref = str(bid.get("Reference No.", "")).strip()
-                if not ref or ref in seen_refs:
+                bid_id = str(bid.get("Bid ID", "")).strip()
+                bid_doc_url = str(bid.get("Bid Doc URL", "")).strip()
+                dedupe_key = bid_id or bid_doc_url or ref
+
+                if not ref or not dedupe_key or dedupe_key in seen_keys:
                     continue
 
                 # Check start date against cutoff
@@ -325,7 +439,7 @@ class GemScraper:
                         stop_paging = True
                         break
 
-                seen_refs.add(ref)
+                seen_keys.add(dedupe_key)
                 bids.append(bid)
 
             if stop_paging:
@@ -354,11 +468,11 @@ class GemScraper:
         )
 
         all_bids: list[dict] = []
-        seen_refs: set[str] = set()
+        seen_keys: set[str] = set()
 
         for i, kw in enumerate(keywords, 1):
             logger.info("Pipeline 1: [%d/%d] Searching keyword: '%s'", i, len(keywords), kw)
-            kw_bids = self.search_keyword_with_date_filter(kw, lookback_days, seen_refs)
+            kw_bids = self.search_keyword_with_date_filter(kw, lookback_days, seen_keys)
             all_bids.extend(kw_bids)
             logger.info("Pipeline 1: [%d/%d] '%s' -> %d new bids (total so far: %d)",
                          i, len(keywords), kw, len(kw_bids), len(all_bids))
@@ -374,18 +488,48 @@ class GemScraper:
     # ------------------------------------------------------------------
     def enrich_with_pdf_text(self, bids: list[dict]) -> dict[str, int]:
         if not bids:
-            return {"downloaded": 0, "failed": 0, "skipped": 0}
+            return {
+                "downloaded": 0,
+                "failed": 0,
+                "skipped": 0,
+                "pdf_file_saved": 0,
+                "pdf_text_extracted": 0,
+                "pdf_extraction_empty": 0,
+                "pdf_link_not_found": 0,
+                "pdf_not_pdf_payload": 0,
+                "pdf_reused": 0,
+            }
 
-        downloaded = 0
+        downloaded = 0  # Legacy: same as pdf_text_extracted
         failed = 0
         skipped = 0
+        pdf_file_saved = 0
+        pdf_text_extracted = 0
+        pdf_extraction_empty = 0
+        pdf_link_not_found = 0
+        pdf_not_pdf_payload = 0
+        pdf_reused = 0
+
+        # Reuse already-fetched document text across bids in the same run.
+        pdf_result_cache: dict[str, tuple[str, str]] = {}
+        pdf_index = self._load_pdf_index()
         try:
             driver = self._create_driver()
         except WebDriverException as exc:
             logger.warning("Selenium unavailable; skipping PDF enrichment: %s", exc)
             for bid in bids:
                 bid["PDF Text"] = ""
-            return {"downloaded": 0, "failed": len(bids), "skipped": 0}
+            return {
+                "downloaded": 0,
+                "failed": len(bids),
+                "skipped": 0,
+                "pdf_file_saved": 0,
+                "pdf_text_extracted": 0,
+                "pdf_extraction_empty": 0,
+                "pdf_link_not_found": len(bids),
+                "pdf_not_pdf_payload": 0,
+                "pdf_reused": 0,
+            }
 
         try:
             # Warm up session
@@ -401,6 +545,9 @@ class GemScraper:
                 bid_no = str(bid.get("Bid No.", "")).strip() or str(bid.get("Reference No.", "")).strip()
                 bid_url = str(bid.get("Source URL", "")).strip()
                 bid_doc_url = str(bid.get("Bid Doc URL", "")).strip()
+                bid_id = str(bid.get("Bid ID", "")).strip()
+                ref = str(bid.get("Reference No.", "")).strip()
+                bid_key = bid_id or bid_doc_url or ref
 
                 if idx % 25 == 0:
                     logger.info("PDF download progress: %d/%d", idx, len(bids))
@@ -411,18 +558,68 @@ class GemScraper:
                     bid["PDF Path"] = ""
                     continue
 
+                cached = pdf_result_cache.get(bid_key) if bid_key else None
+                if cached:
+                    bid["PDF Path"], bid["PDF Text"] = cached
+                    bid["Description"] = bid["PDF Text"][:1500] if bid["PDF Text"] else ""
+                    skipped += 1
+                    pdf_reused += 1
+                    continue
+
+                # Reuse deterministic artifact from previous runs by bid key.
+                if bid_key and isinstance(pdf_index.get(bid_key), dict):
+                    prev_path = str(pdf_index[bid_key].get("pdf_path", "")).strip()
+                    if prev_path:
+                        prev_file = Path(prev_path)
+                        if prev_file.exists() and prev_file.stat().st_size > 80:
+                            prev_text = extract_pdf_text(prev_file) or ""
+                            if prev_text:
+                                bid["PDF Path"] = str(prev_file)
+                                bid["PDF Text"] = prev_text
+                                bid["Description"] = prev_text[:1500]
+                                pdf_result_cache[bid_key] = (str(prev_file), prev_text)
+                                skipped += 1
+                                pdf_reused += 1
+                                continue
+
                 pdf_path: Path | None = None
                 pdf_text = ""
+                link_found = False
+                invalid_payload = False
 
                 # Try Bid Doc URL first
                 if bid_doc_url:
                     for attempt in range(PDF_FETCH_RETRIES + 2):
                         try:
+                            before_download = self._snapshot_pdf_files()
                             driver.get(bid_doc_url)
-                            time.sleep(0.35 + 0.15 * attempt)
+                            time.sleep(0.8 + 0.25 * attempt)
                             self._sync_session_cookies_from_driver(driver)
-                            pdf_path = self._download_pdf(bid_doc_url, bid_no)
+                            browser_pdf = self._await_new_download(before_download, timeout_seconds=5)
+                            if browser_pdf:
+                                link_found = True
+                                pdf_path = self._normalize_downloaded_pdf(browser_pdf, bid_no, bid_key)
+
+                            doc_html = driver.page_source
+                            direct_link = self._extract_pdf_link_from_html(doc_html, bid_doc_url) or bid_doc_url
+                            if direct_link and not pdf_path:
+                                link_found = True
+                            pdf_path = self._download_pdf(direct_link, bid_no)
+                            if not pdf_path:
+                                alt_link = self._extract_pdf_link(driver, bid_url)
+                                if alt_link:
+                                    link_found = True
+                                    pdf_path = self._download_pdf(alt_link, bid_no)
+                                elif direct_link:
+                                    pdf_not_pdf_payload += 1
                             if pdf_path and pdf_path.stat().st_size > 80:
+                                if not self._has_pdf_magic(pdf_path):
+                                    invalid_payload = True
+                                    pdf_not_pdf_payload += 1
+                                    pdf_path = None
+                                    pdf_text = ""
+                                    break
+                                pdf_file_saved += 1
                                 pdf_text = extract_pdf_text(pdf_path) or ""
                                 if pdf_text:
                                     break
@@ -433,9 +630,13 @@ class GemScraper:
 
                 if pdf_path and pdf_text:
                     downloaded += 1
+                    pdf_text_extracted += 1
                     bid["PDF Path"] = str(pdf_path)
                     bid["PDF Text"] = pdf_text
                     bid["Description"] = pdf_text[:1500]
+                    if bid_key:
+                        pdf_result_cache[bid_key] = (str(pdf_path), pdf_text)
+                        pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": "ok"}
                     continue
 
                 # Fallback: extract PDF link from bid page
@@ -446,37 +647,67 @@ class GemScraper:
                     except TimeoutException:
                         pdf_link = ""
                     if pdf_link:
+                        link_found = True
                         break
                     time.sleep(1.0)
 
                 if not pdf_link:
                     failed += 1
+                    pdf_link_not_found += 1
                     bid["PDF Text"] = ""
                     bid["PDF Path"] = ""
+                    if bid_key:
+                        pdf_result_cache[bid_key] = ("", "")
+                        pdf_index[bid_key] = {"pdf_path": "", "status": "link_not_found"}
                     continue
 
                 pdf_path = self._download_pdf(pdf_link, bid_no)
                 if not pdf_path:
                     failed += 1
+                    if link_found and not invalid_payload:
+                        pdf_not_pdf_payload += 1
                     bid["PDF Text"] = ""
                     bid["PDF Path"] = ""
+                    if bid_key:
+                        pdf_result_cache[bid_key] = ("", "")
+                        pdf_index[bid_key] = {"pdf_path": "", "status": "download_failed"}
                     continue
 
+                pdf_file_saved += 1
                 pdf_text = extract_pdf_text(pdf_path)
                 if not pdf_text:
                     failed += 1
+                    pdf_extraction_empty += 1
                     bid["PDF Text"] = ""
                     bid["PDF Path"] = str(pdf_path)
+                    if bid_key:
+                        pdf_result_cache[bid_key] = (str(pdf_path), "")
+                        pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": "text_empty"}
                     continue
 
                 downloaded += 1
+                pdf_text_extracted += 1
                 bid["PDF Path"] = str(pdf_path)
                 bid["PDF Text"] = pdf_text
                 bid["Description"] = pdf_text[:1500]
+                if bid_key:
+                    pdf_result_cache[bid_key] = (str(pdf_path), pdf_text)
+                    pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": "ok"}
         finally:
             driver.quit()
+            self._save_pdf_index(pdf_index)
 
-        return {"downloaded": downloaded, "failed": failed, "skipped": skipped}
+        return {
+            "downloaded": downloaded,
+            "failed": failed,
+            "skipped": skipped,
+            "pdf_file_saved": pdf_file_saved,
+            "pdf_text_extracted": pdf_text_extracted,
+            "pdf_extraction_empty": pdf_extraction_empty,
+            "pdf_link_not_found": pdf_link_not_found,
+            "pdf_not_pdf_payload": pdf_not_pdf_payload,
+            "pdf_reused": pdf_reused,
+        }
 
     def close(self):
         self.session.close()
