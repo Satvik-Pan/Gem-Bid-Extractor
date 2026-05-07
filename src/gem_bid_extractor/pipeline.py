@@ -11,8 +11,6 @@ from .settings import (
     DOUBTFUL_FILE,
     EXCEL_FILE,
     INCLUSION_KEYWORDS,
-    LLM_DOUBTFUL_MIN_CONFIDENCE,
-    LLM_EXTRACT_MIN_CONFIDENCE,
 )
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
@@ -104,6 +102,35 @@ def _sanitize_bid(bid: dict) -> dict:
     return bid
 
 
+def _looks_obviously_non_cyber_firewall(bid: dict) -> bool:
+    text = " ".join(
+        [
+            str(bid.get("Name", "")),
+            str(bid.get("Description", "")),
+            str(bid.get("Category", "")),
+            str(bid.get("Department", "")),
+        ]
+    ).lower()
+    noisy_terms = [
+        "extinguisher", "hydrant", "sprinkler", "fire alarm", "foam", "ladder",
+        "insurance", "vehicle", "furniture", "civil", "paint", "cleaning", "store",
+    ]
+    return any(t in text for t in noisy_terms) and not any(
+        k in text for k in ["network", "security", "router", "vpn", "utm", "waf", "firewall"]
+    )
+
+
+def _looks_cyber_candidate_firewall(bid: dict) -> bool:
+    text = " ".join(
+        [
+            str(bid.get("Name", "")),
+            str(bid.get("Description", "")),
+            str(bid.get("Category", "")),
+        ]
+    ).lower()
+    return any(k in text for k in ["firewall", "network security", "waf", "utm", "vpn", "router", "ngfw"])
+
+
 def _dedupe_bids_by_identity(bids: list[dict]) -> list[dict]:
     deduped: dict[str, dict] = {}
     for bid in bids:
@@ -154,6 +181,42 @@ def run() -> dict:
         b for b in pipeline1_bids
         if not tracker.is_processed(str(b.get("Reference No.", "")).strip())
     ]
+    # Special prefilter only for FIRE WALL noisy search results.
+    fire_wall = []
+    others = []
+    for bid in pipeline1_new:
+        if str(bid.get("Search Keyword", "")).strip().upper() == "FIRE WALL":
+            fire_wall.append(bid)
+        else:
+            others.append(bid)
+    if fire_wall:
+        filtered_fire_wall: list[dict] = []
+        for bid in fire_wall:
+            if _looks_obviously_non_cyber_firewall(bid):
+                logger.info(
+                    "Pipeline 1 FIRE WALL prefilter dropped %s: obvious non-cyber context",
+                    str(bid.get("Reference No.", "")).strip(),
+                )
+                continue
+            if not _looks_cyber_candidate_firewall(bid):
+                logger.info(
+                    "Pipeline 1 FIRE WALL prefilter dropped %s: no cyber signal in metadata",
+                    str(bid.get("Reference No.", "")).strip(),
+                )
+                continue
+            verdict = llm.keep_fire_wall_result(bid)
+            if verdict["keep"]:
+                filtered_fire_wall.append(bid)
+            else:
+                logger.info(
+                    "Pipeline 1 FIRE WALL prefilter dropped %s: %s",
+                    str(bid.get("Reference No.", "")).strip(),
+                    verdict["reason"] or "not cyber-relevant",
+                )
+        pipeline1_new = [*others, *filtered_fire_wall]
+    else:
+        pipeline1_new = others
+
     pipeline1_new = _dedupe_bids_by_identity(pipeline1_new)
     logger.info(
         "Pipeline 1 complete: %d total bids, %d new (not previously processed)",
@@ -165,6 +228,9 @@ def run() -> dict:
         return {
             "pipeline1_total": len(pipeline1_bids),
             "pipeline1_new": 0,
+            "docs_parsed_native": 0,
+            "docs_parsed_ocr": 0,
+            "docs_unresolved": 0,
             "pipeline2_extracted": 0,
             "pipeline2_doubtful": 0,
             "pipeline2_rejected": 0,
@@ -184,13 +250,14 @@ def run() -> dict:
         len(pipeline1_with_pdf), len(pipeline1_no_pdf),
     )
     logger.info(
-        "Pipeline 1 PDF details: file_saved=%d, text_extracted=%d, text_empty=%d, link_not_found=%d, "
-        "not_pdf_payload=%d, reused=%d",
+        "Pipeline 1 PDF details: file_saved=%d, parse_ok=%d, ocr_ok=%d, ocr_failed=%d, missing_link=%d, "
+        "invalid_payload=%d, reused=%d",
         pdf_stats.get("pdf_file_saved", 0),
-        pdf_stats.get("pdf_text_extracted", 0),
-        pdf_stats.get("pdf_extraction_empty", 0),
-        pdf_stats.get("pdf_link_not_found", 0),
-        pdf_stats.get("pdf_not_pdf_payload", 0),
+        pdf_stats.get("parse_ok", 0),
+        pdf_stats.get("ocr_ok", 0),
+        pdf_stats.get("ocr_failed", 0),
+        pdf_stats.get("download_missing_link", 0),
+        pdf_stats.get("download_invalid_payload", 0),
         pdf_stats.get("pdf_reused", 0),
     )
 
@@ -202,10 +269,10 @@ def run() -> dict:
         )
 
     # ==================================================================
-    # PIPELINE 2: LLM deep analysis on every PDF-backed bid
+    # PIPELINE 2: strict routing using keyword hits from each bid document
     # ==================================================================
     logger.info("=" * 70)
-    logger.info("PIPELINE 2: LLM deep analysis (exact keyword + confidence)")
+    logger.info("PIPELINE 2: strict inclusion/exclusion routing")
     logger.info("=" * 70)
 
     extracted: list[dict] = []
@@ -220,7 +287,6 @@ def run() -> dict:
         analysis = llm.classify_bid(bid)
         inclusion_hits = analysis["inclusion_hits"]
         exclusion_hits = analysis["exclusion_hits"]
-        confidence = float(analysis["confidence"])
         selected_keyword = str(analysis["selected_inclusion_keyword"]).strip()
         if selected_keyword and selected_keyword not in inclusion_hits:
             inclusion_hits = [selected_keyword, *inclusion_hits]
@@ -231,7 +297,7 @@ def run() -> dict:
                 else str(bid.get("Search Keyword", "")).strip()
             )
 
-        bid["LLM Confidence"] = round(confidence, 3)
+        bid["LLM Confidence"] = ""
         bid["Inclusion Hits"] = ", ".join(inclusion_hits[:8])
         bid["Exclusion Hits"] = ", ".join(exclusion_hits[:8])
 
@@ -240,8 +306,8 @@ def run() -> dict:
             bid["LLM Reason"] = f"Rejected: exact inclusion phrase not found in PDF. {analysis['reason']}".strip()
             rejected.append(_sanitize_bid(bid))
             logger.info(
-                "Pipeline 2: [%d/%d] REJECTED - %s (no exact inclusion phrase; conf=%.3f)",
-                i, len(pipeline1_with_pdf), ref, confidence,
+                "Pipeline 2: [%d/%d] REJECTED - %s (no exact inclusion phrase)",
+                i, len(pipeline1_with_pdf), ref,
             )
             continue
 
@@ -255,51 +321,32 @@ def run() -> dict:
             ).strip()
             doubtful.append(_sanitize_bid(bid))
             logger.info(
-                "Pipeline 2: [%d/%d] DOUBTFUL - %s (incl=%s, excl=%s, conf=%.3f)",
+                "Pipeline 2: [%d/%d] DOUBTFUL - %s (incl=%s, excl=%s)",
                 i, len(pipeline1_with_pdf), ref,
                 ", ".join(inclusion_hits[:2]),
                 ", ".join(exclusion_hits[:2]),
-                confidence,
             )
             continue
 
-        if confidence >= LLM_EXTRACT_MIN_CONFIDENCE:
-            bid["Final Category"] = "EXTRACTED"
-            bid["Pipeline Source"] = "pipeline2_extracted"
-            bid["LLM Reason"] = f"Selected by keyword: {selected_keyword}. {analysis['reason']}".strip()
-            extracted.append(_sanitize_bid(bid))
-            logger.info(
-                "Pipeline 2: [%d/%d] EXTRACTED - %s (inclusion=%s, conf=%.3f)",
-                i, len(pipeline1_with_pdf), ref,
-                selected_keyword or "search-matched",
-                confidence,
-            )
-        elif confidence >= LLM_DOUBTFUL_MIN_CONFIDENCE:
-            bid["Final Category"] = "DOUBTFUL"
-            bid["Pipeline Source"] = "pipeline2_doubtful_low_confidence"
-            bid["LLM Reason"] = (
-                f"Selected by keyword: {selected_keyword}; "
-                f"Needs review due to lower confidence ({confidence:.3f}). {analysis['reason']}"
-            ).strip()
-            doubtful.append(_sanitize_bid(bid))
-            logger.info(
-                "Pipeline 2: [%d/%d] DOUBTFUL - %s (inclusion=%s, conf=%.3f)",
-                i, len(pipeline1_with_pdf), ref,
-                selected_keyword or "search-matched",
-                confidence,
-            )
-        else:
-            bid["Pipeline Source"] = "pipeline2_reject_low_confidence"
-            bid["LLM Reason"] = (
-                f"Rejected: low cybersecurity relevance confidence ({confidence:.3f}). "
-                f"Selected keyword: {selected_keyword}. {analysis['reason']}"
-            ).strip()
-            rejected.append(_sanitize_bid(bid))
-            logger.info(
-                "Pipeline 2: [%d/%d] REJECTED - %s (low confidence %.3f)",
-                i, len(pipeline1_with_pdf), ref,
-                confidence,
-            )
+        bid["Final Category"] = "EXTRACTED"
+        bid["Pipeline Source"] = "pipeline2_extracted"
+        bid["LLM Reason"] = f"Selected by keyword: {selected_keyword}. {analysis['reason']}".strip()
+        extracted.append(_sanitize_bid(bid))
+        logger.info(
+            "Pipeline 2: [%d/%d] EXTRACTED - %s (inclusion=%s)",
+            i, len(pipeline1_with_pdf), ref,
+            selected_keyword or "search-matched",
+        )
+
+    # Do not drop unresolved documents; keep for ops follow-up.
+    for bid in pipeline1_no_pdf:
+        bid["Final Category"] = "DOUBTFUL"
+        bid["Pipeline Source"] = "pipeline2_doubtful_unresolved_document"
+        bid["Inclusion Hits"] = str(bid.get("Search Keyword", "")).strip()
+        bid["Exclusion Hits"] = ""
+        bid["LLM Confidence"] = ""
+        bid["LLM Reason"] = "Bid document text unresolved after download/ocr attempts; kept for review."
+        doubtful.append(_sanitize_bid(bid))
 
     logger.info(
         "Pipeline 2 complete: EXTRACTED=%d, DOUBTFUL=%d, REJECTED=%d",
@@ -324,13 +371,11 @@ def run() -> dict:
 
     # Mark everything in tracker
     for bid in extracted:
-        conf = float(bid.get("LLM Confidence", 1.0) or 1.0)
-        tracker.mark(bid.get("Reference No.", ""), "extracted", int(conf * 100), conf)
+        tracker.mark(bid.get("Reference No.", ""), "extracted", 100, 1.0)
     for bid in doubtful:
-        conf = float(bid.get("LLM Confidence", 0.5) or 0.5)
-        tracker.mark(bid.get("Reference No.", ""), "doubtful", int(conf * 100), conf)
+        tracker.mark(bid.get("Reference No.", ""), "doubtful", 50, 0.5)
     for bid in rejected:
-        tracker.mark(bid.get("Reference No.", ""), "rejected_exclusion", 0, 0)
+        tracker.mark(bid.get("Reference No.", ""), "rejected", 0, 0)
     for bid in pipeline1_no_pdf:
         tracker.mark(bid.get("Reference No.", ""), "no_pdf", 0, 0)
     tracker.save()
@@ -352,10 +397,11 @@ def run() -> dict:
         "pdf_downloaded": pdf_stats["downloaded"],
         "pdf_failed": pdf_stats["failed"],
         "pdf_file_saved": pdf_stats.get("pdf_file_saved", 0),
-        "pdf_text_extracted": pdf_stats.get("pdf_text_extracted", 0),
-        "pdf_text_empty": pdf_stats.get("pdf_extraction_empty", 0),
-        "pdf_link_not_found": pdf_stats.get("pdf_link_not_found", 0),
-        "pdf_not_pdf_payload": pdf_stats.get("pdf_not_pdf_payload", 0),
+        "docs_parsed_native": pdf_stats.get("parse_ok", 0),
+        "docs_parsed_ocr": pdf_stats.get("ocr_ok", 0),
+        "docs_unresolved": pdf_stats.get("ocr_failed", 0),
+        "download_missing_link": pdf_stats.get("download_missing_link", 0),
+        "download_invalid_payload": pdf_stats.get("download_invalid_payload", 0),
         "pdf_reused": pdf_stats.get("pdf_reused", 0),
         "pipeline2_extracted": len(extracted),
         "pipeline2_doubtful": len(doubtful),

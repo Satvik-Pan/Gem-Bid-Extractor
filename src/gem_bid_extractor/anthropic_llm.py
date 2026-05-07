@@ -99,9 +99,7 @@ Scada/ Scada Firewall
 
 Rules:
 1) Assess the FULL text for exact phrase intent matches. Avoid false positives like "fire ball" or "fire extinguisher" for FIRE WALL/FIREWALL.
-2) Provide cybersecurity relevance confidence from 0.0 to 1.0.
-3) Confidence should be very low for non-cyber tenders (fire safety hardware, civil, furniture, etc).
-4) Always return valid JSON with all fields below.
+2) Always return valid JSON with all fields below.
 
 Return format:
 {
@@ -109,10 +107,17 @@ Return format:
   "inclusion_hits": ["..."],
   "exclusion_hits": ["..."],
   "selected_inclusion_keyword": "<exact keyword from list or empty>",
-  "confidence": 0.0,
-  "is_cybersecurity_relevant": true,
   "reason": "short decision rationale"
 }
+"""
+
+_FIRE_WALL_PREFILTER_PROMPT = """You are filtering noisy GeM search results for the inclusion keyword 'FIRE WALL'.
+
+Keep the bid only when it is relevant to cybersecurity/network security procurement.
+Reject fire-fighting, extinguishers, industrial fire-safety, civil/mechanical, or unrelated domains.
+
+Return strict JSON:
+{"ref":"<Reference No.>","keep":true|false,"reason":"short reason"}
 """
 
 logger = logging.getLogger(__name__)
@@ -297,16 +302,28 @@ class AnthropicClaudeClassifier:
         inclusion_hits = [str(x).strip() for x in inclusion_hits_raw if str(x).strip()] if isinstance(inclusion_hits_raw, list) else []
         exclusion_hits = [str(x).strip() for x in exclusion_hits_raw if str(x).strip()] if isinstance(exclusion_hits_raw, list) else []
         selected = str(result.get("selected_inclusion_keyword", "")).strip()
-        try:
-            confidence = float(result.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = max(0.0, min(1.0, confidence))
         return {
             "inclusion_hits": inclusion_hits,
             "exclusion_hits": exclusion_hits,
             "selected_inclusion_keyword": selected,
-            "confidence": round(confidence, 3),
-            "is_cybersecurity_relevant": bool(result.get("is_cybersecurity_relevant", confidence >= 0.5)),
             "reason": str(result.get("reason", ""))[:500],
+        }
+
+    def keep_fire_wall_result(self, bid: dict) -> dict:
+        ref = self._safe_snippet(bid.get("Reference No.", ""), 120)
+        name = self._safe_snippet(bid.get("Name", ""), 400)
+        category = self._safe_snippet(bid.get("Category", ""), 200)
+        department = self._safe_snippet(bid.get("Department", ""), 300)
+        desc = self._safe_snippet(bid.get("Description", ""), 600)
+        user_content = (
+            f"Reference No.: {ref}\n"
+            f"Title: {name}\n"
+            f"Category: {category}\n"
+            f"Department: {department}\n"
+            f"Description: {desc}\n"
+        )
+        result = self._call_api(_FIRE_WALL_PREFILTER_PROMPT, user_content, max_tokens=300)
+        return {
+            "keep": bool(result.get("keep", False)),
+            "reason": str(result.get("reason", ""))[:300],
         }

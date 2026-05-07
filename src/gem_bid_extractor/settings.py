@@ -125,6 +125,7 @@ COLUMNS = [
     "Category", "Reference No.", "Date", "Name", "Start Date", "Model - Yr", "Quantity",
     "Unit Amount", "Description", "Contact", "EMAIL", "Department",
     "Search Keyword", "Pipeline Source", "Inclusion Hits", "Exclusion Hits",
+    "LLM Confidence", "LLM Reason", "PDF Text Source", "PDF Status",
 ]
 
 GEM_PAGE_URL = "https://bidplus.gem.gov.in/all-bids"
@@ -136,6 +137,12 @@ SESSION_REFRESH_EVERY = 100
 PDF_FETCH_TIMEOUT_SECONDS = int(os.environ.get("PDF_FETCH_TIMEOUT_SECONDS", "25"))
 PDF_FETCH_RETRIES = int(os.environ.get("PDF_FETCH_RETRIES", "2"))
 SELENIUM_HEADLESS = os.environ.get("SELENIUM_HEADLESS", "1").strip().lower() not in {"0", "false", "no"}
+DOWNLOADS_DIR = Path(os.environ.get("DOWNLOADS_DIR", str(Path.home() / "Downloads")))
+
+_TESS_DEFAULT = "C:/Program Files/Tesseract-OCR/tesseract.exe"
+TESSERACT_CMD = os.environ.get("TESSERACT_CMD", _TESS_DEFAULT if Path(_TESS_DEFAULT).exists() else "tesseract")
+OCR_LANG = os.environ.get("OCR_LANG", "eng")
+OCR_TIMEOUT_SECONDS = int(os.environ.get("OCR_TIMEOUT_SECONDS", "180"))
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
@@ -150,6 +157,3 @@ DB_USER = os.environ.get("SUPABASE_DB_USER", "postgres")
 DB_PASSWORD = os.environ.get("SUPABASE_DB_PASSWORD", "")
 DB_SSLMODE = os.environ.get("SUPABASE_DB_SSLMODE", "require")
 
-# Pipeline 2 LLM routing thresholds
-LLM_EXTRACT_MIN_CONFIDENCE = float(os.environ.get("LLM_EXTRACT_MIN_CONFIDENCE", "0.65"))
-LLM_DOUBTFUL_MIN_CONFIDENCE = float(os.environ.get("LLM_DOUBTFUL_MIN_CONFIDENCE", "0.40"))

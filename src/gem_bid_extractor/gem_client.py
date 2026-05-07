@@ -19,8 +19,9 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
 
-from .pdf_reader import extract_pdf_text
+from .pdf_reader import extract_pdf_text_with_ocr
 from .settings import (
+    DOWNLOADS_DIR,
     GEM_API_URL,
     GEM_PAGE_URL,
     LOOKBACK_DAYS,
@@ -390,6 +391,68 @@ class GemScraper:
         except OSError:
             return False
 
+    def _download_via_selenium_click(
+        self,
+        driver: webdriver.Chrome,
+        bid_no: str,
+        bid_key: str,
+        bid_doc_url: str,
+        bid_url: str,
+    ) -> Path | None:
+        click_xpath = (
+            "//a["
+            "contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download') "
+            "or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'document') "
+            "or contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'.pdf') "
+            "or contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download')"
+            "]"
+        )
+        try:
+            before = self._snapshot_pdf_files()
+            if bid_doc_url:
+                driver.get(bid_doc_url)
+            else:
+                driver.get(bid_url)
+            time.sleep(0.8)
+            self._sync_session_cookies_from_driver(driver)
+
+            # 1) Prefer explicit clickable download/doc links.
+            elements = driver.find_elements(By.XPATH, click_xpath)
+            for el in elements[:8]:
+                try:
+                    href = (el.get_attribute("href") or "").strip()
+                    if href:
+                        maybe = self._download_pdf(href, bid_no)
+                        if maybe and self._has_pdf_magic(maybe):
+                            return maybe
+                    driver.execute_script("arguments[0].click();", el)
+                    downloaded = self._await_new_download(before, timeout_seconds=6)
+                    if downloaded:
+                        norm = self._normalize_downloaded_pdf(downloaded, bid_no, bid_key)
+                        if self._has_pdf_magic(norm):
+                            return norm
+                        norm.unlink(missing_ok=True)
+                except Exception:
+                    continue
+
+            # 2) Fallback: parse page html for direct link.
+            html_link = self._extract_pdf_link_from_html(driver.page_source, driver.current_url)
+            if html_link:
+                maybe = self._download_pdf(html_link, bid_no)
+                if maybe and self._has_pdf_magic(maybe):
+                    return maybe
+
+            # 3) Last fallback: legacy link extractor from bid page.
+            if bid_url:
+                link = self._extract_pdf_link(driver, bid_url)
+                if link:
+                    maybe = self._download_pdf(link, bid_no)
+                    if maybe and self._has_pdf_magic(maybe):
+                        return maybe
+        except Exception as exc:
+            logger.debug("Selenium click download failed for %s: %s", bid_no, exc)
+        return None
+
     # ------------------------------------------------------------------
     # Pipeline 1: Search each inclusion keyword, filter by start date
     # ------------------------------------------------------------------
@@ -494,23 +557,34 @@ class GemScraper:
                 "skipped": 0,
                 "pdf_file_saved": 0,
                 "pdf_text_extracted": 0,
+                "parse_ok": 0,
+                "ocr_ok": 0,
+                "ocr_failed": 0,
+                "download_ok": 0,
+                "download_missing_link": 0,
+                "download_invalid_payload": 0,
                 "pdf_extraction_empty": 0,
                 "pdf_link_not_found": 0,
                 "pdf_not_pdf_payload": 0,
                 "pdf_reused": 0,
             }
 
-        downloaded = 0  # Legacy: same as pdf_text_extracted
+        downloaded = 0
         failed = 0
         skipped = 0
         pdf_file_saved = 0
         pdf_text_extracted = 0
+        parse_ok = 0
+        ocr_ok = 0
+        ocr_failed = 0
+        download_ok = 0
+        download_missing_link = 0
+        download_invalid_payload = 0
         pdf_extraction_empty = 0
         pdf_link_not_found = 0
         pdf_not_pdf_payload = 0
         pdf_reused = 0
 
-        # Reuse already-fetched document text across bids in the same run.
         pdf_result_cache: dict[str, tuple[str, str]] = {}
         pdf_index = self._load_pdf_index()
         try:
@@ -519,20 +593,27 @@ class GemScraper:
             logger.warning("Selenium unavailable; skipping PDF enrichment: %s", exc)
             for bid in bids:
                 bid["PDF Text"] = ""
+                bid["PDF Path"] = ""
+                bid["PDF Status"] = "download_missing_link"
             return {
                 "downloaded": 0,
                 "failed": len(bids),
                 "skipped": 0,
                 "pdf_file_saved": 0,
                 "pdf_text_extracted": 0,
-                "pdf_extraction_empty": 0,
+                "parse_ok": 0,
+                "ocr_ok": 0,
+                "ocr_failed": len(bids),
+                "download_ok": 0,
+                "download_missing_link": len(bids),
+                "download_invalid_payload": 0,
+                "pdf_extraction_empty": len(bids),
                 "pdf_link_not_found": len(bids),
                 "pdf_not_pdf_payload": 0,
                 "pdf_reused": 0,
             }
 
         try:
-            # Warm up session
             try:
                 driver.get(GEM_PAGE_URL)
                 time.sleep(1.2)
@@ -556,26 +637,29 @@ class GemScraper:
                     skipped += 1
                     bid["PDF Text"] = ""
                     bid["PDF Path"] = ""
+                    bid["PDF Status"] = "download_missing_link"
                     continue
 
                 cached = pdf_result_cache.get(bid_key) if bid_key else None
                 if cached:
                     bid["PDF Path"], bid["PDF Text"] = cached
                     bid["Description"] = bid["PDF Text"][:1500] if bid["PDF Text"] else ""
+                    bid["PDF Status"] = "cache_reused"
                     skipped += 1
                     pdf_reused += 1
                     continue
 
-                # Reuse deterministic artifact from previous runs by bid key.
                 if bid_key and isinstance(pdf_index.get(bid_key), dict):
                     prev_path = str(pdf_index[bid_key].get("pdf_path", "")).strip()
                     if prev_path:
                         prev_file = Path(prev_path)
                         if prev_file.exists() and prev_file.stat().st_size > 80:
-                            prev_text = extract_pdf_text(prev_file) or ""
+                            prev_text, prev_source = extract_pdf_text_with_ocr(prev_file)
                             if prev_text:
                                 bid["PDF Path"] = str(prev_file)
                                 bid["PDF Text"] = prev_text
+                                bid["PDF Text Source"] = prev_source
+                                bid["PDF Status"] = "parse_ok" if prev_source == "native" else "ocr_ok"
                                 bid["Description"] = prev_text[:1500]
                                 pdf_result_cache[bid_key] = (str(prev_file), prev_text)
                                 skipped += 1
@@ -584,115 +668,116 @@ class GemScraper:
 
                 pdf_path: Path | None = None
                 pdf_text = ""
+                text_source = "none"
                 link_found = False
                 invalid_payload = False
 
-                # Try Bid Doc URL first
                 if bid_doc_url:
                     for attempt in range(PDF_FETCH_RETRIES + 2):
                         try:
-                            before_download = self._snapshot_pdf_files()
-                            driver.get(bid_doc_url)
-                            time.sleep(0.8 + 0.25 * attempt)
-                            self._sync_session_cookies_from_driver(driver)
-                            browser_pdf = self._await_new_download(before_download, timeout_seconds=5)
-                            if browser_pdf:
-                                link_found = True
-                                pdf_path = self._normalize_downloaded_pdf(browser_pdf, bid_no, bid_key)
-
-                            doc_html = driver.page_source
-                            direct_link = self._extract_pdf_link_from_html(doc_html, bid_doc_url) or bid_doc_url
-                            if direct_link and not pdf_path:
-                                link_found = True
-                            pdf_path = self._download_pdf(direct_link, bid_no)
-                            if not pdf_path:
-                                alt_link = self._extract_pdf_link(driver, bid_url)
-                                if alt_link:
-                                    link_found = True
-                                    pdf_path = self._download_pdf(alt_link, bid_no)
-                                elif direct_link:
-                                    pdf_not_pdf_payload += 1
+                            pdf_path = self._download_via_selenium_click(
+                                driver=driver,
+                                bid_no=bid_no,
+                                bid_key=bid_key,
+                                bid_doc_url=bid_doc_url,
+                                bid_url=bid_url,
+                            )
+                            link_found = True if pdf_path else link_found
                             if pdf_path and pdf_path.stat().st_size > 80:
                                 if not self._has_pdf_magic(pdf_path):
                                     invalid_payload = True
+                                    download_invalid_payload += 1
                                     pdf_not_pdf_payload += 1
                                     pdf_path = None
-                                    pdf_text = ""
                                     break
                                 pdf_file_saved += 1
-                                pdf_text = extract_pdf_text(pdf_path) or ""
-                                if pdf_text:
-                                    break
+                                download_ok += 1
+                                pdf_text, text_source = extract_pdf_text_with_ocr(pdf_path)
+                                break
                         except (TimeoutException, WebDriverException) as exc:
                             logger.debug("Bid doc attempt %s for %s: %s", attempt, bid_no, exc)
                         pdf_path = None
                         pdf_text = ""
+                        text_source = "none"
 
-                if pdf_path and pdf_text:
-                    downloaded += 1
-                    pdf_text_extracted += 1
-                    bid["PDF Path"] = str(pdf_path)
-                    bid["PDF Text"] = pdf_text
-                    bid["Description"] = pdf_text[:1500]
-                    if bid_key:
-                        pdf_result_cache[bid_key] = (str(pdf_path), pdf_text)
-                        pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": "ok"}
-                    continue
-
-                # Fallback: extract PDF link from bid page
-                pdf_link = ""
-                for _ in range(PDF_FETCH_RETRIES + 1):
-                    try:
-                        pdf_link = self._extract_pdf_link(driver, bid_url)
-                    except TimeoutException:
-                        pdf_link = ""
-                    if pdf_link:
-                        link_found = True
-                        break
-                    time.sleep(1.0)
-
-                if not pdf_link:
-                    failed += 1
-                    pdf_link_not_found += 1
-                    bid["PDF Text"] = ""
-                    bid["PDF Path"] = ""
-                    if bid_key:
-                        pdf_result_cache[bid_key] = ("", "")
-                        pdf_index[bid_key] = {"pdf_path": "", "status": "link_not_found"}
-                    continue
-
-                pdf_path = self._download_pdf(pdf_link, bid_no)
                 if not pdf_path:
-                    failed += 1
-                    if link_found and not invalid_payload:
-                        pdf_not_pdf_payload += 1
-                    bid["PDF Text"] = ""
-                    bid["PDF Path"] = ""
-                    if bid_key:
-                        pdf_result_cache[bid_key] = ("", "")
-                        pdf_index[bid_key] = {"pdf_path": "", "status": "download_failed"}
-                    continue
+                    pdf_link = ""
+                    for _ in range(PDF_FETCH_RETRIES + 1):
+                        try:
+                            pdf_link = self._extract_pdf_link(driver, bid_url)
+                        except TimeoutException:
+                            pdf_link = ""
+                        if pdf_link:
+                            link_found = True
+                            break
+                        time.sleep(1.0)
 
-                pdf_file_saved += 1
-                pdf_text = extract_pdf_text(pdf_path)
+                    if not pdf_link:
+                        failed += 1
+                        download_missing_link += 1
+                        pdf_link_not_found += 1
+                        bid["PDF Text"] = ""
+                        bid["PDF Path"] = ""
+                        bid["PDF Status"] = "download_missing_link"
+                        if bid_key:
+                            pdf_result_cache[bid_key] = ("", "")
+                            pdf_index[bid_key] = {"pdf_path": "", "status": "download_missing_link"}
+                        continue
+
+                    pdf_path = self._download_pdf(pdf_link, bid_no)
+                    if not pdf_path:
+                        failed += 1
+                        if link_found and not invalid_payload:
+                            pdf_not_pdf_payload += 1
+                        download_invalid_payload += 1
+                        bid["PDF Text"] = ""
+                        bid["PDF Path"] = ""
+                        bid["PDF Status"] = "download_invalid_payload"
+                        if bid_key:
+                            pdf_result_cache[bid_key] = ("", "")
+                            pdf_index[bid_key] = {"pdf_path": "", "status": "download_invalid_payload"}
+                        continue
+
+                    pdf_file_saved += 1
+                    download_ok += 1
+                    pdf_text, text_source = extract_pdf_text_with_ocr(pdf_path)
+
                 if not pdf_text:
                     failed += 1
+                    ocr_failed += 1
                     pdf_extraction_empty += 1
                     bid["PDF Text"] = ""
-                    bid["PDF Path"] = str(pdf_path)
+                    bid["PDF Path"] = str(pdf_path) if pdf_path else ""
+                    bid["PDF Text Source"] = "none"
+                    bid["PDF Status"] = "ocr_failed"
                     if bid_key:
-                        pdf_result_cache[bid_key] = (str(pdf_path), "")
-                        pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": "text_empty"}
+                        pdf_result_cache[bid_key] = (str(pdf_path) if pdf_path else "", "")
+                        pdf_index[bid_key] = {"pdf_path": str(pdf_path) if pdf_path else "", "status": "ocr_failed"}
                     continue
 
                 downloaded += 1
                 pdf_text_extracted += 1
+                if text_source == "native":
+                    parse_ok += 1
+                elif text_source == "ocr":
+                    ocr_ok += 1
                 bid["PDF Path"] = str(pdf_path)
                 bid["PDF Text"] = pdf_text
+                bid["PDF Text Source"] = text_source
+                bid["PDF Status"] = "parse_ok" if text_source == "native" else "ocr_ok"
                 bid["Description"] = pdf_text[:1500]
+                try:
+                    DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+                    digest = hashlib.sha1((bid_key or bid_no).encode("utf-8")).hexdigest()[:10]
+                    fname = f"{self._sanitize_filename(bid_no)}_{digest}.pdf"
+                    copy_path = DOWNLOADS_DIR / fname
+                    if not copy_path.exists():
+                        copy_path.write_bytes(pdf_path.read_bytes())
+                except OSError as exc:
+                    logger.debug("Downloads copy failed for %s: %s", bid_no, exc)
                 if bid_key:
                     pdf_result_cache[bid_key] = (str(pdf_path), pdf_text)
-                    pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": "ok"}
+                    pdf_index[bid_key] = {"pdf_path": str(pdf_path), "status": f"{text_source}_ok"}
         finally:
             driver.quit()
             self._save_pdf_index(pdf_index)
@@ -703,6 +788,12 @@ class GemScraper:
             "skipped": skipped,
             "pdf_file_saved": pdf_file_saved,
             "pdf_text_extracted": pdf_text_extracted,
+            "parse_ok": parse_ok,
+            "ocr_ok": ocr_ok,
+            "ocr_failed": ocr_failed,
+            "download_ok": download_ok,
+            "download_missing_link": download_missing_link,
+            "download_invalid_payload": download_invalid_payload,
             "pdf_extraction_empty": pdf_extraction_empty,
             "pdf_link_not_found": pdf_link_not_found,
             "pdf_not_pdf_payload": pdf_not_pdf_payload,
