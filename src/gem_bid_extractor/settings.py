@@ -28,6 +28,7 @@ SYNC_QUEUE_FILE = DATA_DIR / "db_sync_queue.jsonl"
 DNS_CACHE_FILE = DATA_DIR / "dns_cache.json"
 RUN_LOCK_FILE = DATA_DIR / "extractor.lock"
 PDF_INDEX_FILE = DATA_DIR / "pdf_index.json"
+UNRESOLVED_BIDS_FILE = DATA_DIR / "unresolved_bids.json"
 
 KEYWORDS_FILE = BASE_DIR / "src" / "gem_bid_extractor" / "keywords.csv"
 
@@ -148,6 +149,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
 ANTHROPIC_DNS_CACHE_TTL_SECONDS = int(os.environ.get("ANTHROPIC_DNS_CACHE_TTL_SECONDS", "21600"))
+DOUBTFUL_REVIEW_MIN_ROWS = int(os.environ.get("DOUBTFUL_REVIEW_MIN_ROWS", "10"))
 
 DB_DSN = os.environ.get("SUPABASE_DB_DSN", "")
 DB_HOST = os.environ.get("SUPABASE_DB_HOST", "")

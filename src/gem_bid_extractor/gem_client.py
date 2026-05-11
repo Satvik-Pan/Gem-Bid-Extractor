@@ -35,6 +35,7 @@ from .settings import (
     SELENIUM_HEADLESS,
     SESSION_REFRESH_EVERY,
     SORT_ORDER,
+    UNRESOLVED_BIDS_FILE,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,10 @@ class GemScraper:
         bid_no = _val(doc.get("b_bid_number_parent", ""))
         ra_no = _val(doc.get("b_bid_number", ""))
         parent_bid_id = str(_val(doc.get("b_id_parent", ""))).strip()
+        bid_id = str(_val(doc.get("b_id", ""))).strip()
         ref_no = bid_no or ra_no
+        bid_no_for_url = bid_no or ra_no
+        bid_doc_id = parent_bid_id or bid_id
         return {
             "Category": category.split(",")[0].strip() if category else "",
             "Reference No.": ref_no,
@@ -180,9 +184,9 @@ class GemScraper:
             "Contact": "",
             "EMAIL": _val(doc.get("b.b_created_by", "")),
             "Department": department,
-            "Source URL": f"https://bidplus.gem.gov.in/bidlists/{bid_no}" if bid_no else GEM_PAGE_URL,
-            "Bid Doc URL": f"https://bidplus.gem.gov.in/showbidDocument/{parent_bid_id}" if parent_bid_id else "",
-            "Bid ID": str(_val(doc.get("b_id", ""))),
+            "Source URL": f"https://bidplus.gem.gov.in/bidlists/{bid_no_for_url}" if bid_no_for_url else GEM_PAGE_URL,
+            "Bid Doc URL": f"https://bidplus.gem.gov.in/showbidDocument/{bid_doc_id}" if bid_doc_id else "",
+            "Bid ID": bid_id,
             "Search Keyword": keyword,
             "_start_dt": start_raw,
             "_end_dt": end_raw,
@@ -213,6 +217,7 @@ class GemScraper:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
         return webdriver.Chrome(options=options)
 
     @staticmethod
@@ -317,6 +322,76 @@ class GemScraper:
             except Exception:
                 self.session.cookies.set(name, c.get("value", ""))
 
+    def _sync_driver_cookies_from_session(self, driver: webdriver.Chrome) -> None:
+        """Copy requests session cookies into browser context."""
+        for c in self.session.cookies:
+            cookie = {"name": c.name, "value": c.value, "path": c.path or "/"}
+            if c.domain and not c.domain.startswith("."):
+                cookie["domain"] = c.domain
+            elif c.domain:
+                cookie["domain"] = c.domain.lstrip(".")
+            try:
+                driver.add_cookie(cookie)
+            except Exception:
+                continue
+
+    @staticmethod
+    def _extract_urls_from_onclick(onclick: str, base_url: str) -> list[str]:
+        if not onclick:
+            return []
+        urls: list[str] = []
+        for m in re.finditer(r"https?://[^\"'\s)]+", onclick, flags=re.IGNORECASE):
+            urls.append(m.group(0))
+        for m in re.finditer(r"(/[^\"'\s)]+)", onclick):
+            urls.append(urljoin(base_url, m.group(1)))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for u in urls:
+            if u in seen:
+                continue
+            seen.add(u)
+            deduped.append(u)
+        return deduped
+
+    def _network_doc_candidates(self, driver: webdriver.Chrome) -> list[str]:
+        candidates: list[str] = []
+        try:
+            logs = driver.get_log("performance")
+        except Exception:
+            return []
+        for row in logs:
+            try:
+                message = json.loads(row.get("message", "{}")).get("message", {})
+            except json.JSONDecodeError:
+                continue
+            method = message.get("method", "")
+            params = message.get("params", {})
+            url = ""
+            if method == "Network.responseReceived":
+                response = params.get("response", {})
+                url = str(response.get("url", "")).strip()
+                ctype = str(response.get("mimeType", "")).lower()
+                if "pdf" in ctype and url:
+                    candidates.append(url)
+                    continue
+            if method == "Network.requestWillBeSent":
+                request = params.get("request", {})
+                url = str(request.get("url", "")).strip()
+            low = url.lower()
+            if not url:
+                continue
+            if ".pdf" in low or "download" in low or "showbiddocument" in low:
+                candidates.append(url)
+        # preserve order
+        out: list[str] = []
+        seen: set[str] = set()
+        for c in candidates:
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+        return out
+
     def _try_set_sort_bid_start_latest(self, driver: webdriver.Chrome) -> None:
         """Best-effort: match portal sort to Bid Start Date latest."""
         try:
@@ -398,15 +473,25 @@ class GemScraper:
         bid_key: str,
         bid_doc_url: str,
         bid_url: str,
-    ) -> Path | None:
+    ) -> dict:
         click_xpath = (
-            "//a["
-            "contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download') "
-            "or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'document') "
-            "or contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'.pdf') "
-            "or contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download')"
-            "]"
+            "//*[(self::a or self::button or @role='button' or @onclick) and ("
+            "contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download') or "
+            "contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'document') or "
+            "contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'.pdf') or "
+            "contains(translate(@href,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download') or "
+            "contains(translate(@onclick,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'download') or "
+            "contains(translate(@onclick,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'document')"
+            ")]"
         )
+        result = {
+            "path": None,
+            "reason": "unknown",
+            "page_url": "",
+            "page_title": "",
+            "dom_action_count": 0,
+            "network_candidate_count": 0,
+        }
         try:
             before = self._snapshot_pdf_files()
             if bid_doc_url:
@@ -414,23 +499,38 @@ class GemScraper:
             else:
                 driver.get(bid_url)
             time.sleep(0.8)
+            self._sync_driver_cookies_from_session(driver)
             self._sync_session_cookies_from_driver(driver)
+            result["page_url"] = driver.current_url
+            result["page_title"] = driver.title
 
             # 1) Prefer explicit clickable download/doc links.
             elements = driver.find_elements(By.XPATH, click_xpath)
+            result["dom_action_count"] = len(elements)
             for el in elements[:8]:
                 try:
                     href = (el.get_attribute("href") or "").strip()
                     if href:
                         maybe = self._download_pdf(href, bid_no)
                         if maybe and self._has_pdf_magic(maybe):
-                            return maybe
+                            result["path"] = maybe
+                            result["reason"] = "download_ok"
+                            return result
+                    onclick = (el.get_attribute("onclick") or "").strip()
+                    for oc_url in self._extract_urls_from_onclick(onclick, driver.current_url):
+                        maybe = self._download_pdf(oc_url, bid_no)
+                        if maybe and self._has_pdf_magic(maybe):
+                            result["path"] = maybe
+                            result["reason"] = "download_ok"
+                            return result
                     driver.execute_script("arguments[0].click();", el)
                     downloaded = self._await_new_download(before, timeout_seconds=6)
                     if downloaded:
                         norm = self._normalize_downloaded_pdf(downloaded, bid_no, bid_key)
                         if self._has_pdf_magic(norm):
-                            return norm
+                            result["path"] = norm
+                            result["reason"] = "download_ok"
+                            return result
                         norm.unlink(missing_ok=True)
                 except Exception:
                     continue
@@ -440,7 +540,9 @@ class GemScraper:
             if html_link:
                 maybe = self._download_pdf(html_link, bid_no)
                 if maybe and self._has_pdf_magic(maybe):
-                    return maybe
+                    result["path"] = maybe
+                    result["reason"] = "download_ok"
+                    return result
 
             # 3) Last fallback: legacy link extractor from bid page.
             if bid_url:
@@ -448,10 +550,28 @@ class GemScraper:
                 if link:
                     maybe = self._download_pdf(link, bid_no)
                     if maybe and self._has_pdf_magic(maybe):
-                        return maybe
+                        result["path"] = maybe
+                        result["reason"] = "download_ok"
+                        return result
+            # 4) Network-event fallback for JS-only document endpoints.
+            candidates = self._network_doc_candidates(driver)
+            result["network_candidate_count"] = len(candidates)
+            for net_url in candidates[:12]:
+                maybe = self._download_pdf(net_url, bid_no)
+                if maybe and self._has_pdf_magic(maybe):
+                    result["path"] = maybe
+                    result["reason"] = "download_ok"
+                    return result
+            if result["dom_action_count"] == 0:
+                result["reason"] = "no_dom_action"
+            elif result["network_candidate_count"] == 0:
+                result["reason"] = "network_no_doc_response"
+            else:
+                result["reason"] = "js_action_no_file"
         except Exception as exc:
             logger.debug("Selenium click download failed for %s: %s", bid_no, exc)
-        return None
+            result["reason"] = "exception_in_click_path"
+        return result
 
     # ------------------------------------------------------------------
     # Pipeline 1: Search each inclusion keyword, filter by start date
@@ -584,6 +704,7 @@ class GemScraper:
         pdf_link_not_found = 0
         pdf_not_pdf_payload = 0
         pdf_reused = 0
+        unresolved_rows: list[dict] = []
 
         pdf_result_cache: dict[str, tuple[str, str]] = {}
         pdf_index = self._load_pdf_index()
@@ -671,17 +792,19 @@ class GemScraper:
                 text_source = "none"
                 link_found = False
                 invalid_payload = False
+                click_result: dict = {}
 
                 if bid_doc_url:
                     for attempt in range(PDF_FETCH_RETRIES + 2):
                         try:
-                            pdf_path = self._download_via_selenium_click(
+                            click_result = self._download_via_selenium_click(
                                 driver=driver,
                                 bid_no=bid_no,
                                 bid_key=bid_key,
                                 bid_doc_url=bid_doc_url,
                                 bid_url=bid_url,
                             )
+                            pdf_path = click_result.get("path")
                             link_found = True if pdf_path else link_found
                             if pdf_path and pdf_path.stat().st_size > 80:
                                 if not self._has_pdf_magic(pdf_path):
@@ -718,10 +841,29 @@ class GemScraper:
                         pdf_link_not_found += 1
                         bid["PDF Text"] = ""
                         bid["PDF Path"] = ""
-                        bid["PDF Status"] = "download_missing_link"
+                        fail_reason = (
+                            click_result.get("reason", "download_missing_link")
+                            if "click_result" in locals()
+                            else "download_missing_link"
+                        )
+                        bid["PDF Status"] = fail_reason
+                        unresolved_rows.append(
+                            {
+                                "ref": ref,
+                                "bid_no": bid_no,
+                                "bid_id": bid_id,
+                                "bid_doc_url": bid_doc_url,
+                                "bid_url": bid_url,
+                                "reason": fail_reason,
+                                "page_url": click_result.get("page_url", "") if "click_result" in locals() else "",
+                                "page_title": click_result.get("page_title", "") if "click_result" in locals() else "",
+                                "dom_action_count": click_result.get("dom_action_count", 0) if "click_result" in locals() else 0,
+                                "network_candidate_count": click_result.get("network_candidate_count", 0) if "click_result" in locals() else 0,
+                            }
+                        )
                         if bid_key:
                             pdf_result_cache[bid_key] = ("", "")
-                            pdf_index[bid_key] = {"pdf_path": "", "status": "download_missing_link"}
+                            pdf_index[bid_key] = {"pdf_path": "", "status": fail_reason}
                         continue
 
                     pdf_path = self._download_pdf(pdf_link, bid_no)
@@ -781,6 +923,11 @@ class GemScraper:
         finally:
             driver.quit()
             self._save_pdf_index(pdf_index)
+            UNRESOLVED_BIDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            UNRESOLVED_BIDS_FILE.write_text(
+                json.dumps(unresolved_rows, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
 
         return {
             "downloaded": downloaded,
@@ -798,6 +945,7 @@ class GemScraper:
             "pdf_link_not_found": pdf_link_not_found,
             "pdf_not_pdf_payload": pdf_not_pdf_payload,
             "pdf_reused": pdf_reused,
+            "unresolved_count": len(unresolved_rows),
         }
 
     def close(self):

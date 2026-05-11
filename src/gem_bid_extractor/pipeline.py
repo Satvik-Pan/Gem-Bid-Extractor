@@ -8,9 +8,11 @@ from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
 from .gem_client import GemScraper
 from .settings import (
+    DOUBTFUL_REVIEW_MIN_ROWS,
     DOUBTFUL_FILE,
     EXCEL_FILE,
     INCLUSION_KEYWORDS,
+    UNRESOLVED_BIDS_FILE,
 )
 from .storage import BidTracker
 from .supabase_store import SupabaseStore
@@ -251,7 +253,7 @@ def run() -> dict:
     )
     logger.info(
         "Pipeline 1 PDF details: file_saved=%d, parse_ok=%d, ocr_ok=%d, ocr_failed=%d, missing_link=%d, "
-        "invalid_payload=%d, reused=%d",
+        "invalid_payload=%d, reused=%d, unresolved_count=%d",
         pdf_stats.get("pdf_file_saved", 0),
         pdf_stats.get("parse_ok", 0),
         pdf_stats.get("ocr_ok", 0),
@@ -259,6 +261,7 @@ def run() -> dict:
         pdf_stats.get("download_missing_link", 0),
         pdf_stats.get("download_invalid_payload", 0),
         pdf_stats.get("pdf_reused", 0),
+        pdf_stats.get("unresolved_count", 0),
     )
 
     if pipeline1_no_pdf:
@@ -267,6 +270,8 @@ def run() -> dict:
             "Pipeline 1 PDF retrieval incomplete for %d bids (sample refs: %s)",
             len(pipeline1_no_pdf), refs,
         )
+        if UNRESOLVED_BIDS_FILE.exists():
+            logger.warning("Detailed unresolved bid diagnostics written to: %s", UNRESOLVED_BIDS_FILE)
 
     # ==================================================================
     # PIPELINE 2: strict routing using keyword hits from each bid document
@@ -348,6 +353,41 @@ def run() -> dict:
         bid["LLM Reason"] = "Bid document text unresolved after download/ocr attempts; kept for review."
         doubtful.append(_sanitize_bid(bid))
 
+    if len(doubtful) > DOUBTFUL_REVIEW_MIN_ROWS:
+        logger.info(
+            "Pipeline 2 doubtful refinement: %d rows > threshold %d, running exclusion-weighted Sonnet recheck",
+            len(doubtful),
+            DOUBTFUL_REVIEW_MIN_ROWS,
+        )
+        refined_doubtful: list[dict] = []
+        dropped_from_doubtful = 0
+        for bid in doubtful:
+            # Keep unresolved-document cases in doubtful for ops follow-up.
+            if str(bid.get("Pipeline Source", "")).strip() == "pipeline2_doubtful_unresolved_document":
+                refined_doubtful.append(bid)
+                continue
+            ref = str(bid.get("Reference No.", "")).strip()
+            verdict = llm.review_doubtful_exclusion_strength(bid)
+            if verdict["drop"]:
+                strong_hits = ", ".join(verdict.get("strong_exclusion_hits", [])[:4])
+                note = f"Refined reject (strong exclusion weightage): {verdict.get('reason', '')}".strip()
+                if strong_hits:
+                    note = f"{note} | strong exclusions: {strong_hits}"
+                bid["Final Category"] = "REJECTED"
+                bid["Pipeline Source"] = "pipeline2_reject_refined_doubtful"
+                bid["LLM Reason"] = note
+                rejected.append(_sanitize_bid(bid))
+                dropped_from_doubtful += 1
+                logger.info("Pipeline 2 doubtful refinement: REJECTED %s", ref)
+            else:
+                refined_doubtful.append(bid)
+        doubtful = refined_doubtful
+        logger.info(
+            "Pipeline 2 doubtful refinement complete: moved_to_rejected=%d, remaining_doubtful=%d",
+            dropped_from_doubtful,
+            len(doubtful),
+        )
+
     logger.info(
         "Pipeline 2 complete: EXTRACTED=%d, DOUBTFUL=%d, REJECTED=%d",
         len(extracted), len(doubtful), len(rejected),
@@ -403,6 +443,7 @@ def run() -> dict:
         "download_missing_link": pdf_stats.get("download_missing_link", 0),
         "download_invalid_payload": pdf_stats.get("download_invalid_payload", 0),
         "pdf_reused": pdf_stats.get("pdf_reused", 0),
+        "unresolved_count": pdf_stats.get("unresolved_count", 0),
         "pipeline2_extracted": len(extracted),
         "pipeline2_doubtful": len(doubtful),
         "pipeline2_rejected": len(rejected),

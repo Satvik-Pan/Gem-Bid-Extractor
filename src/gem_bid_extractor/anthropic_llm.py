@@ -120,6 +120,20 @@ Return strict JSON:
 {"ref":"<Reference No.>","keep":true|false,"reason":"short reason"}
 """
 
+_DOUBTFUL_EXCLUSION_REVIEW_PROMPT = """You are doing a second-pass review for DOUBTFUL cybersecurity bids.
+
+Goal: aggressively reduce doubtful rows when exclusion phrases are strongly present.
+Give HIGHER WEIGHTAGE to exclusion phrases than inclusion phrases in this pass.
+
+Decision rule for this pass:
+- drop=true only when exclusion signal is strong/material for procurement intent
+  (brand lock-in, renewal/support-only, endpoint/lan/internet/domain scope mismatch, non-target security stack, etc.)
+- drop=false when exclusion mention appears weak/incidental/contextual and bid may still be relevant.
+
+Return strict JSON only:
+{"ref":"<Reference No.>","drop":true|false,"strong_exclusion_hits":["..."],"reason":"short reason"}
+"""
+
 logger = logging.getLogger(__name__)
 
 
@@ -326,4 +340,40 @@ class AnthropicClaudeClassifier:
         return {
             "keep": bool(result.get("keep", False)),
             "reason": str(result.get("reason", ""))[:300],
+        }
+
+    def review_doubtful_exclusion_strength(self, bid: dict) -> dict:
+        ref = self._safe_snippet(bid.get("Reference No.", ""), 120)
+        name = self._safe_snippet(bid.get("Name", ""), 500)
+        category = self._safe_snippet(bid.get("Category", ""), 200)
+        department = self._safe_snippet(bid.get("Department", ""), 300)
+        search_kw = self._safe_snippet(bid.get("Search Keyword", ""), 120)
+        inclusion_hits = self._safe_snippet(bid.get("Inclusion Hits", ""), 500)
+        exclusion_hits = self._safe_snippet(bid.get("Exclusion Hits", ""), 500)
+        prev_reason = self._safe_snippet(bid.get("LLM Reason", ""), 700)
+        pdf_text = self._safe_snippet(bid.get("PDF Text", ""), 90000)
+
+        user_content = (
+            f"Reference No.: {ref}\n"
+            f"Title: {name}\n"
+            f"Category: {category}\n"
+            f"Department: {department}\n"
+            f"Pipeline-1 Search Keyword: {search_kw}\n"
+            f"Inclusion Hits (first pass): {inclusion_hits}\n"
+            f"Exclusion Hits (first pass): {exclusion_hits}\n"
+            f"First-pass reason: {prev_reason}\n\n"
+            f"=== BID DOCUMENT TEXT ===\n{pdf_text}"
+        )
+
+        result = self._call_api(_DOUBTFUL_EXCLUSION_REVIEW_PROMPT, user_content, max_tokens=450)
+        strong_hits_raw = result.get("strong_exclusion_hits", [])
+        strong_hits = (
+            [str(x).strip() for x in strong_hits_raw if str(x).strip()]
+            if isinstance(strong_hits_raw, list)
+            else []
+        )
+        return {
+            "drop": bool(result.get("drop", False)),
+            "strong_exclusion_hits": strong_hits,
+            "reason": str(result.get("reason", ""))[:400],
         }
