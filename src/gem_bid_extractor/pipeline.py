@@ -8,7 +8,6 @@ from .anthropic_llm import AnthropicClaudeClassifier
 from .excel_writer import ExcelWriter
 from .gem_client import GemScraper
 from .settings import (
-    DOUBTFUL_REVIEW_MIN_ROWS,
     DOUBTFUL_FILE,
     EXCEL_FILE,
     INCLUSION_KEYWORDS,
@@ -352,41 +351,6 @@ def run() -> dict:
         bid["LLM Confidence"] = ""
         bid["LLM Reason"] = "Bid document text unresolved after download/ocr attempts; kept for review."
         doubtful.append(_sanitize_bid(bid))
-
-    if len(doubtful) > DOUBTFUL_REVIEW_MIN_ROWS:
-        logger.info(
-            "Pipeline 2 doubtful refinement: %d rows > threshold %d, running exclusion-weighted Sonnet recheck",
-            len(doubtful),
-            DOUBTFUL_REVIEW_MIN_ROWS,
-        )
-        refined_doubtful: list[dict] = []
-        dropped_from_doubtful = 0
-        for bid in doubtful:
-            # Keep unresolved-document cases in doubtful for ops follow-up.
-            if str(bid.get("Pipeline Source", "")).strip() == "pipeline2_doubtful_unresolved_document":
-                refined_doubtful.append(bid)
-                continue
-            ref = str(bid.get("Reference No.", "")).strip()
-            verdict = llm.review_doubtful_exclusion_strength(bid)
-            if verdict["drop"]:
-                strong_hits = ", ".join(verdict.get("strong_exclusion_hits", [])[:4])
-                note = f"Refined reject (strong exclusion weightage): {verdict.get('reason', '')}".strip()
-                if strong_hits:
-                    note = f"{note} | strong exclusions: {strong_hits}"
-                bid["Final Category"] = "REJECTED"
-                bid["Pipeline Source"] = "pipeline2_reject_refined_doubtful"
-                bid["LLM Reason"] = note
-                rejected.append(_sanitize_bid(bid))
-                dropped_from_doubtful += 1
-                logger.info("Pipeline 2 doubtful refinement: REJECTED %s", ref)
-            else:
-                refined_doubtful.append(bid)
-        doubtful = refined_doubtful
-        logger.info(
-            "Pipeline 2 doubtful refinement complete: moved_to_rejected=%d, remaining_doubtful=%d",
-            dropped_from_doubtful,
-            len(doubtful),
-        )
 
     logger.info(
         "Pipeline 2 complete: EXTRACTED=%d, DOUBTFUL=%d, REJECTED=%d",

@@ -9,6 +9,11 @@ if /I "%~1"=="--scheduled" set "SCHEDULED_MODE=1"
 
 echo ============================================
 echo  GEM Bid Extractor - Daily Run
+if "%SCHEDULED_MODE%"=="1" (
+  echo  Mode: scheduled (use in daily 2:30 PM IST automation)
+) else (
+  echo  Mode: manual
+)
 echo  %date% %time%
 echo ============================================
 
