@@ -107,10 +107,28 @@ export default function Home() {
   };
 
   const copyRefToClipboard = async (ref: string) => {
+    const value = String(ref || "").trim();
+    if (!value) return;
     try {
-      await navigator.clipboard.writeText(ref);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return;
+      }
     } catch {
-      // Clipboard API can fail on some browsers/security contexts.
+      // Continue to legacy fallback.
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      ta.setAttribute("readonly", "true");
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch {
+      // Ignore clipboard fallback errors.
     }
   };
 
@@ -196,6 +214,7 @@ export default function Home() {
                           href={sourceUrl}
                           target="_blank"
                           rel="noreferrer"
+                          onMouseDown={() => void copyRefToClipboard(row.reference_no)}
                           onClick={() => void copyRefToClipboard(row.reference_no)}
                         >
                           {row.reference_no}
